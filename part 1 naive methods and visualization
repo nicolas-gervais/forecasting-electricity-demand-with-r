@@ -1,0 +1,842 @@
+Sys.setlocale("LC_TIME", "French")
+
+# Loading librairies
+
+library(timeSeries)
+library(ggplot2)
+library(ggpmisc)
+library(timeDate)
+library(scales)
+require(gridExtra)
+library(zoo)
+library(reshape2)
+library(chron)
+
+# Function to downsample from hourly to daily by summing all hourly values
+
+hourly_to_daily <- function(ts_hourly, day) {
+  d_days <- character(); d_demand <- numeric()  #initialize day and demand vectors
+  day_last=day[1]    #initialize day_last
+  daily_sum=0        #initialize daily_sum
+  j=1                #initialize daily index
+  for(i in 1:length(ts_hourly)){
+    day_i  <- day[i]    
+    
+    if (day_i == day_last) {  #if day at index i corresponds to the same as index i-1 (i.e. same day)
+      daily_sum = daily_sum + ts_hourly[i]   #sum up demand
+    } else {
+      d_days[j]=as.character(day_last)   #if different day, store day at i-1 in d_days
+      d_demand[j]=daily_sum              #store demand at i-1 in d_demand
+      daily_sum = ts_hourly[i]           #start new daily sum with i
+      day_last = day_i                   #reinitialize day_last
+      j=j+1                              #daily index increases
+    }
+  }
+  d_days[j]=as.character(day_last)
+  d_demand[j]=daily_sum
+  ts_daily <- timeSeries(d_demand, d_days, format="%Y-%m-%d")
+  return(ts_daily)
+}
+
+# Function to load demand time series
+
+read.raw_data <- function(path="./Fichiers MDP/hrl_load_metered.csv") {
+  
+  datetime <- character(); demand <- numeric()      #initialize datetime and demand
+  dem <- read.csv(paste(path,sep=","))
+  demand <- c(demand, dem$mw)
+  day  <- as.Date(dem$datetime_beginning_ept, "%m/%d/%Y %H:%M:%S %p")
+  datetime <- c(datetime, as.character(dem$datetime_beginning_ept))
+  ts_hourly <- timeSeries(demand, datetime, format="%m/%d/%Y %I:%M:%S %p")
+  colnames(ts_hourly) <- c('Demand (mw)')
+  ts_daily <- hourly_to_daily(ts_hourly, day)
+  return(ts_daily)
+  
+}
+
+# Load the daily weather time series after it has been exported to csv
+
+read.daily_weather_data <- function(path="./Fichiers MDP/weather_ts_daily.csv") {
+  wea_data <- read.csv(paste(path,sep=","))
+  ts_daily <- timeSeries(wea_data, format="%Y-%m-%d")
+  colnames(ts_daily) <- c('TO_C', 'TE_C', 'Tt_C', 'HDD_C', 'CDD_C', 'Tmin_C',
+                          'Tmax_C', 'Precip_in', 'Humidity_pct', 'WindSpeed_MPH', 'CP')
+  return(ts_daily)
+}
+
+read.daily_data <- function(path="./Fichiers MDP/ts_daily.csv") {
+  
+  datetime <- character(); demand <- numeric()   
+  dem <- read.csv(paste(path,sep=","))
+  ts_daily <- timeSeries(dem, format="%Y-%m-%d")
+  colnames(ts_daily) <- c('mw')
+  return(ts_daily)
+  
+}
+
+# Downsample an hourly timeseries of numeric variables to daily via different aggregation functions
+wea_hourly_to_daily <- function(ts_hourly, day, T_ref) {
+  
+  # Initialize day and numeric vectors
+  
+  d_days <- character(); d_TO <- numeric(); d_Precip <- numeric(); 
+  d_Hum <- numeric(); d_Wind <- numeric()
+  d_Tt <- numeric(); d_HDD <- numeric(); d_CDD <- numeric(); d_TE <- numeric (); d_CP <- numeric()
+  d_Tmin <- numeric(); d_Tmax <-numeric()
+  
+  # Initialize memory variables
+  
+  day_last=day[1]    
+  daily_sum_precip=0 
+  daily_mean_temp=0
+  daily_min_temp=9999
+  daily_max_temp=-9999
+  daily_mean_hum=0   
+  daily_mean_wind=0
+  j=1
+  daily_records=0
+  
+  # Aggregating daily values
+  
+  for(i in 1:length(day)){
+    day_i  <- day[i]    
+    
+    if (day_i == day_last) {  #if day at index i corresponds to the same as index i-1 (ie same day)
+      daily_records = daily_records + 1  #counting number of records in a day, not always 24...
+      daily_sum_precip = daily_sum_precip + ts_hourly$Precip_in[i]
+      daily_mean_temp = daily_mean_temp + ts_hourly$Temp_C[i]
+      if (ts_hourly$Temp_C[i] < daily_min_temp) {
+        daily_min_temp <- ts_hourly$Temp_C[i]
+      }
+      if (ts_hourly$Temp_C[i] > daily_max_temp) {
+        daily_max_temp <- ts_hourly$Temp_C[i]
+      } 
+      daily_mean_hum = daily_mean_hum + ts_hourly$Humidity_pct[i]
+      daily_mean_wind= daily_mean_wind + ts_hourly$WindSpeed_MPH[i]  
+    } else {
+      d_days[j]=as.character(day_last)   #if different day, store day at i-1 in d_days
+      d_Precip[j]=daily_sum_precip       #store sum of precipitation at i-1 in d_Precip
+      d_TO[j]=daily_mean_temp / daily_records       #store mean of temperature in d_TO
+      d_Hum[j]=daily_mean_hum / daily_records       #store mean of humidity in d_Hum
+      d_Wind[j]=daily_mean_wind / daily_records     #store mean of wind speed in d_Wind
+      d_Tmax[j]=daily_max_temp
+      d_Tmin[j]=daily_min_temp
+      d_Tt[j] = (daily_min_temp+daily_max_temp) / 2   #store Tt in d_Tt 
+      d_HDD[j] = max((T_ref - d_Tt[j]), 0)            #store HDD in d_HDD[j]
+      d_CDD[j] = max((d_Tt[j] - T_ref), 0)            #store CDD in d_CDD[j]
+      if (d_TO[j] >= 18.3) d_CP[j] = 0 else d_CP[j] = d_Wind[j]^0.5*(18.3-d_TO[j])
+      if (j > 1) d_TE[j]=0.5*d_TO[j]+0.5*d_TE_previous else d_TE[j]=d_TO[j]
+      
+      #starting a new day
+      
+      daily_records <- 1
+      d_TE_previous <- d_TE[j]
+      daily_sum_precip <- ts_hourly$Precip_in[i]
+      daily_mean_temp <- ts_hourly$Temp_C[i]
+      daily_min_temp <- ts_hourly$Temp_C[i]
+      daily_max_temp <- ts_hourly$Temp_C[i]
+      daily_mean_hum = ts_hourly$Humidity_pct[i]
+      daily_mean_wind= ts_hourly$WindSpeed_MPH[i]  
+      
+      day_last = day_i                   #reinitialize day_last
+      j=j+1                              #daily index increases
+    }
+  }
+  d_days[j]=as.character(day_last)   #if different day, store day at i-1 in d_days
+  d_Precip[j]=daily_sum_precip       #store sum of precipitation at i-1 in d_Precip
+  d_TO[j]=daily_mean_temp / daily_records       #store mean of temperature in d_TO
+  d_Hum[j]=daily_mean_hum / daily_records       #store mean of humidity in d_Hum
+  d_Wind[j]=daily_mean_wind / daily_records     #store mean of wind speed in d_Wind
+  d_Tmax[j]=daily_max_temp
+  d_Tmin[j]=daily_min_temp
+  d_Tt[j] = (daily_min_temp+daily_max_temp) / 2   #store Tt in d_Tt (to compute HDD & CDD)
+  d_HDD[j] = max((T_ref - d_Tt[j]), 0)            #store HDD in d_HDD[j]
+  d_CDD[j] = max((d_Tt[j] - T_ref), 0)            #store CDD in d_CDD[j]
+  if (d_TO[j] >= 18.3) d_CP[j] = 0 else d_CP[j] = d_Wind[j]^0.5*(18.3-d_TO[j])
+  if (j > 1) d_TE[j]=0.5*d_TO[j]+0.5*d_TE_previous else d_TE[j]=d_TO[j]
+  
+  # Combining all numeric vectors into a data frame prior to converting to a time series
+  
+  daily_data_frame <- cbind.data.frame(d_TO, d_TE, d_Tt, d_HDD, d_CDD, d_Tmin, d_Tmax, d_Precip, 
+                                       d_Hum, d_Wind, d_CP)
+  
+  # Finally converting date vector and numeric data matrix into timeseries and renaminc columns
+  
+  ts_daily <- timeSeries(daily_data_frame, d_days, format="%Y-%m-%d")  
+  colnames(ts_daily) <- c('TO_C', 'TE_C', 'Tt_C', 'HDD_C', 'CDD_C', 'Tmin_C', 
+                          'Tmax_C', 'Precip_in', 'Humidity_pct', 'WindSpeed_MPH', 'CP')
+  
+  return(ts_daily)
+}
+
+get_upper_tri <- function(cormat){
+  
+  # This function is used to get the upper triangle from a correlation matrix
+  
+  cormat[lower.tri(cormat)]<- NA
+  return(cormat)
+}
+
+reorder_cormat <- function(cormat){
+  
+  # This function is used to reorganize the correlation matrix to improve readability
+  
+  dd <- as.dist((1-cormat)/2)
+  hc <- hclust(dd)
+  cormat <-cormat[hc$order, hc$order]
+}
+
+ts_daily <- read.raw_data()
+
+# Deletes 29th of february in 2008, 2012, 2016
+
+length(ts_daily) # supposed to be 5113 befire deletion
+ts_daily[1155, ]
+ts_daily[2616, ]
+ts_daily[4077, ]
+ts_daily <- ts_daily[-c(1155, 2616, 4077), ]
+length(ts_daily) # supposed to be 5110 after deletion
+
+# Exports a csv prior to imputation of outliers
+
+write.table(ts_daily, file = "./Fichiers MDP/ts_daily_del.csv", row.names=TRUE, 
+            col.names=c('mw'), sep=",") 
+
+# Imputes outliers
+min(ts_daily)
+ts_daily[]
+aberrant_2012 <- ts_daily[2857:2863, ]
+aberrant_2012 
+
+ts_daily[2857] <- 107933.86  
+ts_daily[2858] <- 115177.65  
+ts_daily[2859] <- 112667.77 
+ts_daily[2860] <- 113232.09  
+ts_daily[2861] <- 113359.93  
+ts_daily[2862] <- 102053.19  
+ts_daily[2863] <- 103077.70  
+
+aberrant_2007 <- ts_daily[940]
+aberrant_2007
+ts_daily[940, ] <- 130530.25 
+
+ts_daily[2857:2863, ] # double check, new values are above 100,000
+ts_daily[940, ] # double check, 130530
+
+# Exports imputed csv
+
+write.table(ts_daily, file = "./Fichiers MDP/ts_daily_del_imp.csv", row.names=TRUE, 
+            col.names=c('mw'), sep=",")
+
+################################
+#   EXPLORATORY DATA ANALYSIS  #
+################################
+
+# Sets the theme for all plots
+
+theme_set(theme_dark(base_size = 16))
+th <-   theme(
+  plot.title = element_text(color="black", size=20, face="bold.italic", hjust = 0.5),
+  axis.title.x = element_text(color="black", size=14),
+  axis.title.y = element_text(color="black", size=14),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = "grey45"),
+  axis.text.x = element_text(color = "black", size = 12, hjust = .5, vjust = .5),
+  axis.text.y = element_text(color = "black", size = 12, hjust = 1), 
+  panel.grid.major = element_line(color="grey50")
+)
+
+# Reads the csv file (clean)
+
+csv <- read.csv("./Fichiers MDP/ts_daily_del_imp.csv", head=FALSE, sep=",", skip=1)
+names(csv) <- c("Date", "Demand")
+day <- as.Date(csv$Date, format="%Y-%m-%d")
+length(csv$Date) # DOIT ÊTRE 5110 NI PLUS NI MOINS
+
+# Generates the clean plot (2005 to 2018, daily)
+
+ggplot(csv, aes(x = day, y = Demand/1000)) + 
+  ggtitle("Demande quotidienne d'électricité") +
+  geom_line(stat = "identity", color="grey0") +
+  xlab("Date") + 
+  ylab("Demande (GW)") +
+  scale_x_date(labels = date_format("%Y"), breaks="1 year") + 
+  th
+
+# Reads the csv file (with outliers)
+
+csv_dirty <- read.csv("./Fichiers MDP/ts_daily_del.csv", head=FALSE, sep=",", skip=1)
+names(csv_dirty) <- c("Date", "Demand")
+day <- as.Date(csv_dirty$Date, format="%Y-%m-%d")
+length(csv_dirty$Date) # DOIT ÊTRE 5110 NI PLUS NI MOINS
+
+# Generates the plot (2005 to 2018, daily, with outliers)
+
+ggplot(csv_dirty, aes(x = day, y = Demand/1000)) + 
+  ggtitle("Demande quotidienne d'électricité") +
+  geom_line(stat = "identity", color="grey0") +
+  stat_valleys(geom = "point", span = 5, ignore_threshold = 0.9, 
+               color="white", size=5, alpha=.3) +
+  # stat_valleys(geom = "text", span = 5, ignore_threshold = 0.85, 
+               # x.label.fmt = "Valeur aberrante", 
+               # size = 5, vjust = -0.5, color="black", hjust = -0.15) +
+  labs(x = "Date", y = "Demande (GW)") +
+  scale_x_date(labels = date_format("%Y"), breaks="1 year") + 
+  th
+
+# Generates the trend 
+
+ggplot(csv, aes(x = day, y = Demand/1000)) + 
+  ggtitle("Tendance entre 2005 et 2018") +
+  labs(x = "Date", y = "Demande (GW)") +
+  scale_x_date(labels = date_format("%Y"), breaks="1 year") + 
+  stat_smooth(color = "black", fill = "black", method = "loess") +
+  th
+
+# Generates the weekly plot and adds a "by week" grouping variable
+
+csv$Week <- as.Date(cut(day, breaks = "week", start.on.monday = FALSE)) 
+
+for(i in 1:nrow(csv)) {
+  csv$Weekday[i] <- weekdays(as.Date(csv$Date[i]))
+}
+
+hlist <- c("USChristmasDay","USGoodFriday","USIndependenceDay","USLaborDay",
+           "USNewYearsDay","USThanksgivingDay", "USElectionDay")     
+
+myholidays  <- dates(as.character(holiday(2005:2018,hlist)),format="Y-M-D")
+
+for(i in 1:nrow(csv)) {
+  csv$Holiday[i] <- is.holiday(as.Date(csv$Date[i]),myholidays)
+}
+
+head(csv, 30)
+
+WeekdayFactor <- factor(csv$Weekday, levels = c("dimanche", "lundi", "mardi", "mercredi", 
+                                                "jeudi", "vendredi", "samedi"))
+
+ggplot(csv, aes(x=WeekdayFactor, y=Demand/1000)) +
+  ggtitle("Demande d'électricité par jour de la semaine") +
+  labs(x = "Jour de la semaine", y = "Demande (GW)") +
+  # geom_line(aes(csv$Weekday, group=Week), alpha=0.03, color = "black", size=3) +
+  # geom_jitter(color="black", alpha=0.2, size=2, width=.2) +
+  # geom_violin(fill = "grey40", color = "#000000", trim=TRUE)+
+  stat_boxplot(geom ='errorbar', color="black") +
+  geom_boxplot(aes(x=WeekdayFactor, y=Demand/1000), color="black", fill="grey70", 
+               outlier.size=0.6, outlier.alpha = 0.2) +
+  th 
+
+# Generates the yearly plot and adds a month grouping variable
+
+csv$Month <- format(as.Date(csv$Date), "%m")
+csv$Year <- format(as.Date(csv$Date), "%Y")
+csv$MonthDay <- format(as.Date(csv$Date), "%m-%d")
+
+# MonthFactor <- factor(csv$Month, levels = c("021", "02", "03", "04", "05", "06", "07", 
+                                            # "08", "09", "10", "11", "12")) # can be del i think
+
+ggplot(csv, aes(x=as.Date(MonthDay, format="%m-%d"), y=Demand/1000, group=Year)) +
+  ggtitle("Demande d'électricité par jour") +
+  labs(x = "Mois", y = "Demande (GW)") +
+  # geom_point(alpha=.3, size=3, color="white") +
+  geom_point(size=3,color=csv$Demand , alpha=0.3) + # color=csv$Year
+  # coord_cartesian(xlim = as.Date(c("12-15", "12-31"), format="%m-%d")) +
+  scale_x_date(date_breaks="1 month", labels = date_format("%m")) + 
+  th +
+  theme(axis.text.x = element_text(angle = 35, vjust = .7))
+
+# Summons hourly data 
+
+hourly <- read.csv("./Fichiers MDP/hrl_load_metered.csv", head=FALSE, sep=",", skip=1) 
+hourly <- hourly[-c(1, 3:6, 8)]
+names(hourly) <- c("Date", "Demand_hour")
+subset <- hourly[67920:69384, ]
+datehour<- as.POSIXct(subset$Date, format="%m/%d/%Y %I:%M:%S %p")
+
+# Generates the plot for the 30th of october 2012, by hour 
+
+plot1 <- ggplot(subset, aes(x = subset$Date, y = subset$Demand_hour)) + 
+  ggtitle("Hourly Electricity Demand During 2012 Crash") +
+  geom_line(aes(x = datehour, y = subset$Demand_hour), color="black") +
+  labs(x = "Date", y = "Demand (GW)") +
+  th
+plot1
+
+# Generates the plot for the 29th of july 2007, by hour 
+
+subset2 <- hourly[22440:22680, ] 
+datehour2<- as.POSIXct(subset2$Date, format="%m/%d/%Y %I:%M:%S %p")
+
+plot2 <- ggplot(subset2, aes(x = subset2$Date, y = subset2$Demand_hour)) + 
+  ggtitle("Hourly Electricity Demand During 2007 Crash") +
+  geom_line(aes(x = datehour2, y = subset2$Demand_hour), color="black") +
+  labs(x = "Date", y = "Demand (GW)") +
+  th
+plot2
+
+# Combines both plots to save space
+
+superplot <- grid.arrange(plot1, plot2, ncol=2)
+
+# End 
+
+# dev.cur()
+# q()
+
+#####################
+#   NAIVE METHODS   #
+#####################
+
+# Converting time series into data frame
+
+df_daily <- data.frame(Date=as.Date(time(ts_daily)), mw=ts_daily, row.names=NULL)
+
+# Computes (1) no-change model forecast
+
+naive1 <- df_daily[[2]][-length(df_daily[[2]])]
+observed1 <- df_daily[[2]][-1]
+subset_naive1 = csv
+subset_naive1 = subset_naive1[-1, ]
+subset_naive1$naive1 = naive1
+subset_naive1$Date <- as.Date(subset_naive1$Date)
+subset_naive1_nov_2018 = subset_naive1[5049:5078, ]
+
+# Computes bias and MAPE
+
+bias1 <- mean(naive1-observed1)
+pbias1 <- mean((naive1-observed1)/observed1)*100
+mape1 <- mean(abs((naive1-observed1)/observed1))*100
+df_daily2 <- data.frame(Date=df_daily2[[1]], mw=df_daily2[[2]])  #revert to a df
+
+# Computes (2) no-change yearly seasonal model forecast
+
+naive2 <- df_daily2[[2]][-((length(df_daily2[[2]])-364):length(df_daily2[[2]]))]
+observed2 <- df_daily2[[2]][-(1:365)]
+subset_naive2 = csv
+subset_naive2 = subset_naive2[-c(1:365), ]
+subset_naive2$naive2 = naive2
+subset_naive2$Date <- as.Date(subset_naive2$Date)
+subset_naive2_nov_2018 = subset_naive2[4685:4714, ] 
+# Computes bias and MAPE
+
+bias2 <- mean(naive2-observed2)
+pbias2 <- mean((naive2-observed2)/observed2)*100
+mape2 <- mean(abs((naive2-observed2)/observed2))*100
+
+# Compares bias and MAPE of (1) over the same period as (2)
+
+bias1.a <- mean(naive1[-(1:364)]-observed1[-(1:364)])
+pbias1.a <- mean(
+  (naive1[-(1:364)]-observed1[-(1:364)])/observed1[-(1:364)])*100
+mape1.a <- mean(abs((naive1[-(1:364)]-observed1[-(1:364)])/
+                      observed1[-(1:364)]))*100
+
+# Computes (3) rolling three-day window
+
+naive3 <- rollMean(ts_daily,3,align= "right" ,na.pad = TRUE)[-(1:2)]
+naive3 <- naive3[-length(naive3)]
+observed3 <- df_daily[[2]][-(1:3)]
+subset_naive3 = csv
+subset_naive3 = subset_naive3[-c(1:3), ]
+subset_naive3$naive3 = naive3
+subset_naive3$Date <- as.Date(subset_naive3$Date)
+subset_naive3_nov_2018 = subset_naive3[5047:5076, ]
+
+# Computes (4) no-change last week model forecast
+
+naive4    <- df_daily[[2]][-((length(df_daily[[2]])-6):length(df_daily[[2]]))]
+observed4 <- df_daily[[2]][-(1:7)]
+
+subset_naive4 = csv
+subset_naive4 = subset_naive4[-c(1:7), ]
+subset_naive4$naive4 = naive4
+subset_naive4$Date <- as.Date(subset_naive4$Date)
+subset_naive4_nov_2018 = subset_naive4[5043:5072, ]
+
+# Computes bias and MAPE
+
+bias4 <- mean(naive4-observed4)
+pbias4 <- mean((naive4-observed4)/observed4)*100
+mape4 <- mean(abs((naive4-observed4)/observed4))*100
+
+# Compares bias and MAPE of (4) over the same period as (2)
+bias4.a <- mean(naive4[-(1:358)]-observed4[-(1:358)])
+pbias4.a <- mean(
+  (naive4[-(1:358)]-observed4[-(1:358)])/observed4[-(1:358)])*100
+mape4.a <- mean(abs((naive4[-(1:358)]-observed4[-(1:358)])/
+                      observed4[-(1:358)]))*100
+
+# Computes bias and MAPE
+
+bias3 <- mean(naive3-observed3)
+pbias3 <- mean((naive3-observed3)/observed3)*100
+mape3 <- mean(abs((naive3-observed3)/observed3))*100
+
+# Compares bias and MAPE of (3) over the same period as (2)
+
+bias3.a <- mean(naive3[-(1:362)]-observed3[-(1:362)])
+pbias3.a <- mean(
+  (naive3[-(1:362)]-observed3[-(1:362)])/observed3[-(1:362)])*100
+mape3.a <- mean(abs((naive3[-(1:362)]-observed3[-(1:362)])/
+                      observed3[-(1:362)]))*100
+
+# Compares 4 naive methods from 2006 to 2019
+cat("Results for 2006-2019\n")
+cat("no-change model: bias=",bias1.a,
+    "%bias=",pbias1.a,"mape=",mape1.a,"\n")
+cat("seasonal no-change model: bias=",bias2,
+    "%bias=",pbias2,"mape=",mape2,"\n")
+cat("rolling three-day window: bias=",bias3.a,
+    "%bias=",pbias3.a,"mape=",mape3.a,"\n\n")
+cat("seasonal no change last week: bias=",bias4.a,
+    "%bias=",pbias4.a,"mape=",mape4.a,"\n\n")
+
+#Compares 3 methods just for the last 365 days
+
+n1 <- length(naive1)
+y2016 <- (n1-364):n1
+bias1.1 <- mean(naive1[y2016]-observed1[y2016])
+pbias1.1 <- mean((naive1[y2016]-observed1[y2016])/observed1[y2016])*100
+mape1.1 <- mean(abs((naive1[y2016]-observed1[y2016])/observed1[y2016]))*100
+
+n2 <- length(naive2) # ERREUR DANS LE BIAIS
+y2016 <- (n2-364):n2
+bias2.1 <- mean(naive2[y2016]-observed2[y2016])
+pbias2.1 <- mean((naive2[y2016]-observed2[y2016])/observed2[y2016])*100
+mape2.1 <- mean(abs((naive2[y2016]-observed2[y2016])/observed2[y2016]))*100
+
+n3 <- length(naive3)
+y2016 <- (n3-364):n3
+bias3.1 <- mean(naive3[y2016]-observed3[y2016])
+pbias3.1 <- mean((naive3[y2016]-observed3[y2016])/observed3[y2016])*100
+mape3.1 <- mean(abs((naive3[y2016]-observed3[y2016])/observed3[y2016]))*100
+
+cat("Results for last 365 days only\n")
+cat("no-change model: bias=",bias1.1, "%bias=",pbias1.1,"mape=",mape1.1,"\n") # mape 6.91
+cat("seasonal 1 year: bias=",bias2.1, "%bias=",pbias2.1,"mape=",mape2.1,"\n") # mape 10.84
+cat("rolling 3-day : bias=",bias3.1, "%bias=",pbias3.1,"mape=",mape3.1,"\n") # mape 9.00
+cat("seasonal 1 week : bias=",bias4.1, "%bias=",pbias4.1,"mape=",mape4.1,"\n") # mape 8.31
+
+# Generates the plot of the three methods in november 2018
+
+library(directlabels)
+
+ggplot(subset_naive1_nov_2018, aes(x = subset_naive1_nov_2018$Date, y = 
+                                     subset_naive1_nov_2018$Demand/1000)) + 
+  ggtitle("Méthodes de prévision (novembre 2018)") +
+  
+  geom_point(size=4, shape=18) +
+  geom_area(stat = "identity", color="grey0", alpha=0.4) +
+  
+  geom_line(aes(y=subset_naive1_nov_2018$naive1/1000), color="darkblue") +
+  geom_point(aes(y=subset_naive1_nov_2018$naive1/1000), color="darkblue", 
+             alpha=1, size=3, shape=17) +
+  
+  geom_line(aes(y=subset_naive2_nov_2018$naive2/1000), color="darkgreen") +
+  geom_point(aes(y=subset_naive2_nov_2018$naive2/1000), color="darkgreen", 
+             size=3, shape=15) + 
+  
+  geom_line(aes(y=subset_naive3_nov_2018$naive3/1000), color="darkorange") +
+  geom_point(aes(y=subset_naive3_nov_2018$naive3/1000), color="darkorange", 
+             size=3, shape=16) +
+  
+  geom_line(aes(y=subset_naive4_nov_2018$naive4/1000), color="darkred") +
+  geom_point(aes(y=subset_naive4_nov_2018$naive4/1000), color="darkred", 
+             size=3, shape=25, fill="darkred") +
+  
+  xlab("Date") + 
+  ylab("Demande (GW)") +
+  coord_cartesian(ylim=c(90,124)) +
+  scale_x_date(labels = date_format("%d %b %Y"), breaks="5 days", 
+               minor_breaks = "1 day", expand = c(0, 0)) + 
+  th + 
+  theme(panel.grid.minor = element_line(color="grey50", size=0.3),
+        axis.text.x = element_text(vjust = .7))
+
+###########################
+#   FEATURE ENGINEERING   #    
+###########################
+
+# Uncomment the below if running for first time. 
+# Otherwise, leave commented and load daily ts directly
+
+# Reading the weather data, which comes in two csv files: 
+# 1 for years 2005-2009 + #2 for years 2009-2019
+wea1 <- read.csv("./Fichiers MDP/WBAN_54743_2005_2009.csv", sep=",", na.strings=c("","NA"), 
+                 stringsAsFactors = FALSE)
+wea2 <- read.csv("./Fichiers MDP/WBAN_54743_2009_2019.csv", sep=",",  na.strings=c("","NA"), 
+                 stringsAsFactors = FALSE)
+
+# Concatenates so that the date for the 13 years are in 
+# one vector (for each variable)
+
+nj.wea.day <- c(as.Date(wea1$DATE, "%Y-%m-%d %H:%M"), as.Date(wea2$DATE, "%Y-%m-%d %H:%M"))
+nj.wea.datetime <- c(as.character(wea1$DATE), as.character(wea2$DATE))
+nj.wea.temp <- c(as.numeric(wea1$HOURLYDRYBULBTEMPC), as.numeric(wea2$HOURLYDRYBULBTEMPC))
+nj.wea.precip <- c(as.numeric(wea1$HOURLYPrecip), as.numeric(wea2$HOURLYPrecip))
+nj.wea.hum <- c(as.numeric(wea1$HOURLYRelativeHumidity), as.numeric(wea2$HOURLYRelativeHumidity))
+nj.wea.wind <-c(as.numeric(wea1$HOURLYWindSpeed), as.numeric(wea2$HOURLYWindSpeed))
+
+
+# Builds data frame out of numeric data to look for missing values
+wea_data_frame <- cbind.data.frame(nj.wea.temp, nj.wea.precip, nj.wea.hum, nj.wea.wind)
+summary(wea_data_frame)  # 5362 NAs in temp, 37935 NAs in precip, 6131 NAs in hum, 5555 NAs in wind
+
+
+# Replaces NAs elements in temperature and humidity with previous values
+
+wea_data_frame$nj.wea.hum <- na.locf(wea_data_frame$nj.wea.hum)
+wea_data_frame$nj.wea.temp <- na.locf(wea_data_frame$nj.wea.temp)
+summary(wea_data_frame)
+head(wea_data_frame)
+
+# Replaces NAs in precipitation and wind with 0
+
+for(i in 1:length(wea_data_frame$nj.wea.precip)) {
+  if (is.na(wea_data_frame$nj.wea.precip[i])) {
+    wea_data_frame$nj.wea.precip[i] <- 0
+  }
+  if (is.na(wea_data_frame$nj.wea.wind[i])) {
+    wea_data_frame$nj.wea.wind[i] <- 0
+  }
+}
+summary(wea_data_frame)
+
+# Creates time series
+
+wea_ts_hourly <- timeSeries(wea_data_frame, nj.wea.datetime, format="%Y-%m-%d %H:%M")
+colnames(wea_ts_hourly) <- c('Temp_C', 'Precip_in', 'Humidity_pct', 'WindSpeed_MPH')
+
+# Converts hourly time series into daily time series, 
+# while also creating all feature variables
+
+length(wea_ts_hourly)
+wea_ts_daily <- wea_hourly_to_daily(wea_ts_hourly, nj.wea.day, 18.3) 
+
+#comment if this step was done already
+
+# Removes 2019 to be consistent with electricity demand
+
+wea_ts_daily <- wea_ts_daily[-seq(5109, 5139),]
+
+# Removes February 29th to be consistent with electricity demand
+#ts_daily[1154, ] # CHECK IF NEEDED BEFORE. 
+#ts_daily[1155, ] # REMINDER: 5110 OBS.
+#ts_daily[2616, ]
+#ts_daily[4072, ]
+#wea_ts_daily <- wea_ts_daily[-c(1155, 2616, 4072), ]
+length(wea_ts_daily$TO_C) #supposed to be 5110, we are missing 5 values
+
+# Imputes missing days from October 30th 2012 to November 4th 2012 (inclusively)
+ts_daily <- read.daily_mw_data(path="./Fichiers MDP/ts_daily_del_imp.csv")
+
+# Loads demand dataframe so that we can impute the row names into the wea_df_daily
+
+mw_df_daily <- data.frame(ts_daily) 
+wea_df_daily <- data.frame(wea_ts_daily)
+last_row <- wea_df_daily[2857,]
+wea_df_daily <- rbind(wea_df_daily[1:2857,], last_row, last_row, last_row, last_row, 
+                      last_row, wea_df_daily[2858:5105,])
+wea_df_daily[2855:2869,] #it worked, but we need to change the date
+row.names(wea_df_daily) <- row.names(mw_df_daily)
+wea_df_daily[2855:2869,] #it worked, but we need to change the date
+index(wea_df_daily[2855]) #it worked
+
+# Converts wea_df_daily back into a time series
+wea_ts_daily <- timeSeries(wea_df_daily, row.names(wea_df_daily), format="%Y-%m-%d") 
+
+# Saves daily time series into csv file
+write.table(wea_ts_daily, file = "./Fichiers MDP/weather_ts_daily.csv", row.names=TRUE,
+            col.names=c('TO_C', 'TE_C', 'Tt_C', 'HDD_C', 'CDD_C', 'Tmin_C', 'Tmax_C',
+                        'Precip_in', 'Humidity_pct', 'WindSpeed_MPH', 'CP'), sep=",")
+
+# Reads wea_ts_daily if this was generated already, 
+# Reads ts_daily, create two dataframes and merge them
+
+wea_ts_daily <- read.daily_weather_data(path="./Fichiers MDP/weather_ts_daily.csv") 
+# comment the above if this step was not done already
+
+length(wea_ts_daily$TO_C)
+# ts_daily <- read.daily_mw_data(path="./Fichiers MDP/ts_daily_del_imp.csv")
+mw_df_daily <- data.frame(ts_daily)
+wea_df_daily <- data.frame(wea_ts_daily)
+combined_df <- merge(mw_df_daily, wea_df_daily, by="row.names")
+
+# Plotting effect of temperature on demand
+
+ggplot(combined_df, aes(x = combined_df$TO_C, y = combined_df$TS.1/1000)) +
+  ggtitle("Température vs. demande d'électricité") +
+  labs(x = "Température (°C)", y = "Demande (GW)") +
+  geom_point(alpha=.3, size=3) + 
+  th 
+  
+
+# Plotting effect of humidity on demand
+
+ggplot(combined_df, aes(x = combined_df$Humidity_pct, y = combined_df$TS.1/1000)) +
+  ggtitle("Humidité vs. demande d'électricité") +
+  labs(x = "Humidité (%)", y = "Demande (GW)") +
+  geom_point(alpha=.3, size=3) + 
+  th 
+
+# Plotting effect of precipitation on demand
+
+ggplot(combined_df, aes(x = combined_df$Precip_in, y = combined_df$TS.1/1000)) +
+  ggtitle("Précipitations vs. demande d'électricité") +
+  labs(x = "Précipitations (pouces)", y = "Demande (GW)") +
+  geom_point(alpha=.3, size=3) + 
+  th 
+
+# Plotting effect of windspeed on demand
+
+ggplot(combined_df, aes(x = combined_df$WindSpeed_MPH, y = combined_df$TS.1/1000)) +
+  ggtitle("Vitesse du vent vs. demande d'électricité") +
+  labs(x = "Vent (MPH)", y = "Demande (GW)") +
+  geom_point(alpha=.3, size=3) + 
+  th 
+
+# Plotting effect of wind chilling factor on demand
+
+ggplot(combined_df, aes(x = combined_df$CP, y = combined_df$TS.1/1000)) +
+  ggtitle("Facteur de refroidissement vs. demande d'électricité") +
+  labs(x = "Facteur de refroidissement", y = "Demande (GW)") +
+  geom_point(alpha=.3, size=3) + 
+  th 
+
+# Plotting effect of hdd on demand
+
+ggplot(combined_df, aes(x = combined_df$HDD_C, y = combined_df$TS.1/1000)) +
+  ggtitle("Degrés-jours de chauffage vs. demande d'électricité") +
+  labs(x = "Degrés-jours de chauffage (°C)", y = "Demande (GW)") +
+  geom_point(alpha=.3, size=3) + 
+  th 
+
+# Plotting effect of cdd on demand
+
+ggplot(combined_df, aes(x = combined_df$CDD_C, y = combined_df$TS.1/1000)) +
+  ggtitle("Degrés-jours de refroidissement vs. demande d'électricité") +
+  labs(x = "Degrés-jours de refroidissement (°C)", y = "Demande (GW)") +
+  geom_point(alpha=.3, size=3) + 
+  th 
+
+# Creates a correlation matrix
+# combined_df <- combined_df[c(1:5110), -c(1,5,8,9)]
+cormat <- round(cor(combined_df, method="pearson"), 2)
+#cormat <- reorder_cormat(cormat)
+upper_tri <- get_upper_tri(cormat)
+melted_cormat <- melt(upper_tri, na.rm = TRUE)
+
+# Prints heatmap from correlation matrix
+ggheatmap <- ggplot(melted_cormat, aes(Var2, Var1, fill = value))+
+  geom_tile(color = "black")+
+  scale_fill_gradient2(low = "#56B4E9", high = "#E69F00", mid = "white", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab",
+                       name="Pearson\nCorrelation") +
+  theme_set(theme_dark(base_size = 12)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+                                   size = 12, hjust = 1))+
+  coord_fixed()
+ggheatmap + 
+  geom_text(aes(Var2, Var1, label = value), color = "black", size = 3) +
+  ggtitle("Corrélations entre variables météorologiques") +
+  geom_line(stat = "identity", color="grey100") +
+  theme(
+    plot.title = element_text(color="black", size=20, face="bold.italic", hjust = 0.5),
+    axis.title.x = element_text(color="white", size=14),
+    axis.title.y = element_text(color="white", size=14),
+    panel.grid.major = element_blank(),
+    axis.text.x = element_text(angle = 45, vjust = 1, size = 12, hjust = 1),
+    axis.text.y = element_text(color = "black", size = 12, angle = 0, hjust = 1), 
+    panel.grid.minor = element_line(colour="grey45"),
+    #panel.border = element_blank(),
+    #panel.background = element_blank(),
+    axis.ticks = element_blank(),
+    legend.justification = c(1, 0),
+    legend.position = c(0.38, 0.7),
+    legend.direction = "horizontal",
+    legend.title = element_text(colour = "white", size=10),
+    legend.key = element_rect(colour = "white", fill="grey45"),
+    legend.text=element_text(color="white",size=10),
+    legend.background = element_rect(fill="transparent"))+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                               title.position = "top", title.hjust = 0.5))
+
+# Generates the plot of holidays 
+holiday1 <- csv[349:365, c(2, 6, 7)]
+holiday2 <- csv[714:730, c(2, 6, 7)]
+holiday3 <- csv[1079:1095, c(2, 6, 7)]
+holiday4 <- csv[1444:1460, c(2, 6, 7)]
+holiday5 <- csv[1809:1825, c(2, 6, 7)]
+holiday6 <- csv[2174:2190, c(2, 6, 7)]
+holiday7 <- csv[2539:2555, c(2, 6, 7)]
+holiday8 <- csv[2904:2920, c(2, 6, 7)]
+holiday9 <- csv[3269:3285, c(2, 6, 7)]
+holiday10 <- csv[3634:3650, c(2, 6, 7)]
+holiday11 <- csv[3999:4015, c(2, 6, 7)]
+holiday12 <- csv[4364:4380, c(2, 6, 7)]
+holiday13 <- csv[4729:4745, c(2, 6, 7)]
+holiday14 <- csv[5094:5110, c(2, 6, 7)]
+day1 <- as.Date(holiday1$MonthDay, format="%m-%d")
+day2 <- as.Date(holiday2$MonthDay, format="%m-%d")
+day3 <- as.Date(holiday3$MonthDay, format="%m-%d")
+day4 <- as.Date(holiday4$MonthDay, format="%m-%d")
+day5 <- as.Date(holiday5$MonthDay, format="%m-%d")
+day6 <- as.Date(holiday6$MonthDay, format="%m-%d")
+day7 <- as.Date(holiday7$MonthDay, format="%m-%d")
+day8 <- as.Date(holiday8$MonthDay, format="%m-%d")
+day9 <- as.Date(holiday9$MonthDay, format="%m-%d")
+day10 <- as.Date(holiday10$MonthDay, format="%m-%d")
+day11 <- as.Date(holiday11$MonthDay, format="%m-%d")
+day12 <- as.Date(holiday12$MonthDay, format="%m-%d")
+day13 <- as.Date(holiday13$MonthDay, format="%m-%d")
+day14 <- as.Date(holiday14$MonthDay, format="%m-%d")
+class(day12)
+holiday14
+length(holiday13$MonthDay)
+ggplot(holiday1, aes(x = MonthDay, y = Demand/1000, group=Year)) + 
+  ggtitle("Demande quotidienne d'électricité") +
+  geom_line(stat = "identity", color="grey0") +
+  geom_line(aes(holiday2$MonthDay, y=holiday2$Demand/1000)) +
+  geom_line(aes(holiday3$MonthDay, y=holiday3$Demand/1000)) +
+  geom_line(aes(holiday4$MonthDay, y=holiday4$Demand/1000)) +
+  geom_line(aes(holiday5$MonthDay, y=holiday5$Demand/1000)) +
+  geom_line(aes(holiday6$MonthDay, y=holiday6$Demand/1000)) +
+  geom_line(aes(holiday7$MonthDay, y=holiday7$Demand/1000)) +
+  geom_line(aes(holiday8$MonthDay, y=holiday8$Demand/1000)) +
+  geom_line(aes(holiday9$MonthDay, y=holiday9$Demand/1000)) +
+  geom_line(aes(holiday10$MonthDay, y=holiday10$Demand/1000)) +
+  geom_line(aes(holiday11$MonthDay, y=holiday11$Demand/1000)) +
+  geom_line(aes(holiday12$MonthDay, y=holiday12$Demand/1000)) +
+  geom_line(aes(holiday13$MonthDay, y=holiday13$Demand/1000)) +
+  geom_vline(aes(xintercept = 11), color="white", size=39.5, alpha=0.15) +
+  # geom_line(aes(x=day14, y=holiday14$Demand/1000, group=MonthDay)) +
+  # scale_x_discrete(breaks = 1:31)
+  xlab("Date") + 
+  ylab("Demande (GW)") +
+  th
+
+# Generates the clean plot (2005 to 2018, daily)
+
+ggplot(csv, aes(x = day, y = Demand/1000)) + 
+  ggtitle("Demande quotidienne d'électricité") +
+  geom_line(group=csv$Year) +
+  xlab("Date") + 
+  coord_cartesian(xlim = c(325, 500)) +
+  ylab("Demande (GW)") +
+  scale_x_date(labels = date_format("%Y"), breaks="1 year") + 
+  th
+
+# Generates boxplot of férié vs pas férié
+
+ggplot(csv, aes(y=Demand/1000, x=Holiday)) +
+  ggtitle("Demande d'électricité par jour selon férié ou pas") +
+  stat_boxplot(geom ='errorbar', color="black") +
+  geom_boxplot(color="black", fill="grey70", outlier.size=0.6, outlier.alpha = 0.2) + 
+  labs(x = "Type de journée", y = "Demande (GW)") + 
+  scale_x_discrete(labels=c("Pas férié","Férié")) +
+  th +
+  theme(axis.text.x = element_text(vjust = .7))
+
+combined_df[941, ]
+
+write.csv(combined_df, file="./Fichiers MDP/all_var_df.csv", row.names = FALSE)
