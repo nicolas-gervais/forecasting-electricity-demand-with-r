@@ -1,0 +1,1771 @@
+#
+# Program: projet-e10.R
+#
+# Purpose: Predict electricity demand (MWh) in PS
+#
+# Written by: 
+# Nicolas Gervais (11263889)
+# Jean-S�bastien Grondin (11264314)
+# Jonathan Lemire(11129642)
+# Lucille Marie Louise Pollux (11190869)
+
+# Created: 1 February 2019
+# Updated: 3 February 2019
+# Updated: 13 February 2019
+#
+# ------------------------------------------------------
+#
+
+# Set locale to English language
+Sys.setlocale("LC_TIME", "C")
+
+# Loading librairies
+library(timeSeries)
+library(zoo)
+library(ggplot2)
+library(ggpmisc)
+library(timeDate)
+library(scales)
+require(gridExtra)
+library(DataCombine)
+library(reshape2)
+library(chron)
+library(forecast)
+library(DescTools)
+library(vars)
+library(astsa)
+library(lmtest)
+
+
+#################
+#   FUNCTIONS   #
+#################
+
+read.raw_data <- function(path="../data/hrl_load_metered.csv") {
+  # This function is used to load the hourly electricity demand time series
+  
+  datetime <- character(); demand <- numeric()      #initialize datetime and demand
+  dem <- read.csv(paste(path,sep=","))
+  demand <- c(demand, dem$mw)
+  day  <- as.Date(dem$datetime_beginning_ept, "%m/%d/%Y %H:%M:%S %p")
+  datetime <- c(datetime, as.character(dem$datetime_beginning_ept))
+  mylist <- remove.dst_duplicate(demand, datetime)
+  mylist2 <- fill.dst_empty_row(mylist$demand, mylist$datetime)
+  demand_cor <- mylist2$demand
+  datetime_cor <- mylist2$datetime
+  ts_hourly <- timeSeries(demand_cor, datetime_cor, format="%m/%d/%Y %I:%M:%S %p")
+  colnames(ts_hourly) <- c('Demand (mw)')
+  ts_daily <- hourly_to_daily(ts_hourly, day)
+  return(ts_daily)
+}
+
+remove.dst_duplicate <- function(demand, datetime) {
+  # This function can be used to remove the duplicated hours form the electricity demand datetime
+  # resulting from the daylight saving time changes (1 hour duplicated
+  # every year since 1964).
+  
+  demand_c <- numeric()
+  datetime_c <- character()
+  idx <- 1
+  demand_c[idx] <- demand[1]
+  datetime_c[idx] <- datetime[1]
+  idx <- idx  +  1
+  
+  for(i in 2:length(demand)){
+    if (datetime[i] == datetime[i-1]) {  #if there is a duplicate hour at hour i
+      print(datetime[i])      #don't add it, just print it, we keep the first, we discard the second
+    } else {
+      demand_c[idx] <- demand[i]
+      datetime_c[idx] <- datetime[i]
+      idx <- idx  +  1
+    }
+  }
+  mylist <- list("demand" = demand_c, "datetime" = datetime_c)
+  return(mylist)
+}
+
+fill.dst_empty_row <- function(demand, datetime) {
+  # This function can be used to fill the missing hours form the electricity demand datetime
+  # resulting from the daylight saving time changes (1 hour missing
+  # every year since 1964).
+  
+  demand_c <- numeric()
+  datetime_c <- character()
+  idx <- 1
+  demand_c[idx] <- demand[1]
+  datetime_c[idx] <- datetime[1]
+  idx <- idx  +  1
+  
+  for(i in 2:length(demand)){
+    now = as.POSIXct(datetime[i], format="%m/%d/%Y %H:%M:%S %p", tz="EST")
+    before= as.POSIXct(datetime[i-1], format="%m/%d/%Y %H:%M:%S %p", tz="EST")
+    
+    if ((now - before) == 2) {  #if there is a missing hour
+      # cat("datetime[i-1]:",datetime[i-1], "\n")
+      # cat("datetime[i]:", datetime[i], "\n")
+      # cat("demand[i-1]:", demand[i-1], "\n")
+      # cat("demand[i]:", demand[i], "\n")
+      before= as.POSIXct(datetime[i-1], format="%m/%d/%Y %H:%M:%S %p", tz="CET")   #writing time in a time zone that doesnt have DST
+      datetime_c[idx]=as.character(before + 3600, format="%m/%d/%Y %H:%M:%S %p")
+      demand_c[idx] = (demand[i] + demand[i-1])/2
+      idx=idx + 1
+      datetime_c[idx]=datetime[i]
+      demand_c[idx] = demand[i]
+      # cat("datetime_c[idx-1]:",datetime_c[idx-1], "\n")
+      # cat("datetime_c[idx]:", datetime_c[idx], "\n")  
+      # cat("demand_c[idx-1]:", demand_c[idx-1], "\n")
+      # cat("demand_c[idx]:", demand_c[idx], "\n")
+      idx=idx + 1
+    }else {
+      datetime_c[idx]=datetime[i]
+      demand_c[idx] = demand[i]
+      idx=idx + 1
+    }
+  }
+  mylist <- list("demand" = demand_c, "datetime" = datetime_c)
+  return(mylist)
+}
+
+read.daily_mw_data <- function(path="../data/ts_daily.csv") {
+  # This function can be used to load a daily electricity demand time series, if
+  # this time series has already been generated. This enables saving time as the 
+  # function to convert from hourly to daily is expensive in computing time.
+  dem <- read.csv(paste(path,sep=","))
+  ts_daily <- timeSeries(dem, format="%Y-%m-%d")
+  colnames(ts_daily) <- c('mw')
+  return(ts_daily)
+}
+
+read.dshw_data <- function(path="../data/dshw.csv") {
+  # This function can be used to load the dshw smoothing predictions for daily electricity demand.
+  # if this time series has already been generated. This enables saving time as the 
+  # function to create it in the first place is expensive in computing time.
+  dshw_data <- read.csv(paste(path,sep=","))
+  ts_daily <- timeSeries(dshw_data, format="%Y-%m-%d")
+  colnames(ts_daily) <- c('mw')
+  return(ts_daily)
+}
+
+read.tbats_data <- function(path="../data/tbats.csv") {
+  # This function can be used to load the dshw smoothing predictions for daily electricity demand.
+  # if this time series has already been generated. This enables saving time as the 
+  # function to create it in the first place is expensive in computing time.
+  dshw_data <- read.csv(paste(path,sep=","))
+  ts_daily <- timeSeries(dshw_data, format="%Y-%m-%d")
+  colnames(ts_daily) <- c('mw')
+  return(ts_daily)
+}
+
+
+read.daily_weather_data <- function(path="../data/weather_ts_daily.csv") {
+  # This function can be used to load the daily weather time series, if
+  # this time series has already been generated. This enables saving time as the 
+  # function to convert from hourly to daily is expensive in computing time.
+  wea_data <- read.csv(paste(path,sep=","))
+  ts_daily <- timeSeries(wea_data, format="%Y-%m-%d")
+  colnames(ts_daily) <- c('TO_C', 'TE_C', 'Tt_C', 'HDD_C', 'CDD_C', 'Tmin_C',
+                          'Tmax_C', 'Precip_in', 'Humidity_pct', 'WindSpeed_MPH', 'CP')
+  return(ts_daily)
+}
+
+hourly_to_daily <- function(ts_hourly, day) {
+  # This function is used to downsample an hourly timeseries of electricity demand to daily by
+  # summing all hourly values
+  d_days <- character(); d_demand <- numeric()  #initialize day and demand vectors
+  day_last=day[1]    #initialize day_last
+  daily_sum=0        #initialize daily_sum
+  j=1                #initialize daily index
+  for(i in 1:length(ts_hourly)){
+    day_i  <- day[i]    
+    if (day_i == day_last) {  #if day at index i corresponds to the same as index i-1 (i.e. same day)
+      daily_sum = daily_sum  +  ts_hourly[i]   #sum up demand
+    } else {
+      d_days[j]=as.character(day_last)   #if different day, store day at i-1 in d_days
+      d_demand[j]=daily_sum              #store demand at i-1 in d_demand
+      daily_sum = ts_hourly[i]           #start new daily sum with i
+      day_last = day_i                   #reinitialize day_last
+      j=j + 1                              #daily index increases
+    }
+  }
+  d_days[j]=as.character(day_last)
+  d_demand[j]=daily_sum
+  ts_daily <- timeSeries(d_demand, d_days, format="%Y-%m-%d")
+  return(ts_daily)
+}
+
+
+wea_hourly_to_daily <- function(ts_hourly, day, T_ref_c, T_ref_h) {
+  # This function is used to to downsample an hourly timeseries of numeric variables to daily via different aggregation functions
+  # T_ref_h is the reference temperature for the HDD, T_ref_c is the reference temperature for the CDD.
+  # Column names: 'Temp_C', 'Precip_in', 'Humidity_pct', 'WindSpeed_MPH'
+  
+  # Initialize day and numeric vectors
+  d_days <- character(); d_TO <- numeric(); d_Precip <- numeric(); d_Hum <- numeric(); d_Wind <- numeric()
+  d_Tt <- numeric(); d_HDD <- numeric(); d_CDD <- numeric(); d_TE <- numeric (); d_CP <- numeric()
+  d_Tmin <- numeric(); d_Tmax <-numeric()
+  
+  # Initialize memory variables
+  day_last=day[1]    
+  daily_sum_precip=0 
+  daily_mean_temp=0
+  daily_min_temp=9999
+  daily_max_temp=-9999
+  daily_mean_hum=0   
+  daily_mean_wind=0
+  j=1
+  daily_records=0
+  
+  # Aggregating daily values
+  for(i in 1:length(day)){
+    day_i  <- day[i]    
+    
+    if (day_i == day_last) {  #if day at index i corresponds to the same as index i-1 (i.e. same day)
+      daily_records = daily_records  +  1  #counting number of records in a day, not always 24...
+      daily_sum_precip = daily_sum_precip  +  ts_hourly$Precip_in[i]
+      daily_mean_temp = daily_mean_temp  +  ts_hourly$Temp_C[i]
+      if (ts_hourly$Temp_C[i] < daily_min_temp) {
+        daily_min_temp <- ts_hourly$Temp_C[i]
+      }
+      if (ts_hourly$Temp_C[i] > daily_max_temp) {
+        daily_max_temp <- ts_hourly$Temp_C[i]
+      } 
+      daily_mean_hum = daily_mean_hum  +  ts_hourly$Humidity_pct[i]
+      daily_mean_wind= daily_mean_wind  +  ts_hourly$WindSpeed_MPH[i]  
+    } else {
+      d_days[j]=as.character(day_last)   #if different day, store day at i-1 in d_days
+      d_Precip[j]=daily_sum_precip       #store sum of precipitation at i-1 in d_Precip
+      d_TO[j]=daily_mean_temp / daily_records       #store mean of temperature in d_TO
+      d_Hum[j]=daily_mean_hum / daily_records       #store mean of humidity in d_Hum
+      d_Wind[j]=daily_mean_wind / daily_records     #store mean of wind speed in d_Wind
+      d_Tmax[j]=daily_max_temp
+      d_Tmin[j]=daily_min_temp
+      d_Tt[j] = (daily_min_temp + daily_max_temp) / 2   #store Tt in d_Tt (to be used for computing HDD and CDD)
+      d_HDD[j] = max((T_ref_h - d_Tt[j]), 0)            #store HDD in d_HDD[j]
+      d_CDD[j] = max((d_Tt[j] - T_ref_c), 0)            #store CDD in d_CDD[j]
+      if (d_TO[j] >= T_ref_h) d_CP[j] = 0 else d_CP[j] = d_Wind[j]^0.5*(T_ref_h-d_TO[j])
+      if (j > 1) d_TE[j]=0.5*d_TO[j] + 0.5*d_TE_previous else d_TE[j]=d_TO[j]
+      
+      #starting a new day
+      daily_records <- 1
+      d_TE_previous <- d_TE[j]
+      daily_sum_precip <- ts_hourly$Precip_in[i]
+      daily_mean_temp <- ts_hourly$Temp_C[i]
+      daily_min_temp <- ts_hourly$Temp_C[i]
+      daily_max_temp <- ts_hourly$Temp_C[i]
+      daily_mean_hum = ts_hourly$Humidity_pct[i]
+      daily_mean_wind= ts_hourly$WindSpeed_MPH[i]  
+
+      day_last = day_i                   #reinitialize day_last
+      j=j + 1                              #daily index increases
+    }
+  }
+  d_days[j]=as.character(day_last)   #if different day, store day at i-1 in d_days
+  d_Precip[j]=daily_sum_precip       #store sum of precipitation at i-1 in d_Precip
+  d_TO[j]=daily_mean_temp / daily_records       #store mean of temperature in d_TO
+  d_Hum[j]=daily_mean_hum / daily_records       #store mean of humidity in d_Hum
+  d_Wind[j]=daily_mean_wind / daily_records     #store mean of wind speed in d_Wind
+  d_Tmax[j]=daily_max_temp
+  d_Tmin[j]=daily_min_temp
+  d_Tt[j] = (daily_min_temp + daily_max_temp) / 2   #store Tt in d_Tt (to be used for computing HDD and CDD)
+  d_HDD[j] = max((T_ref_h - d_Tt[j]), 0)            #store HDD in d_HDD[j]
+  d_CDD[j] = max((d_Tt[j] - T_ref_c), 0)            #store CDD in d_CDD[j]
+  if (d_TO[j] >= T_ref_h) d_CP[j] = 0 else d_CP[j] = d_Wind[j]^0.5*(T_ref_h-d_TO[j])
+  if (j > 1) d_TE[j]=0.5*d_TO[j] + 0.5*d_TE_previous else d_TE[j]=d_TO[j]
+  
+  # Combining all numeric vectors into a data frame prior to converting to a time series
+  daily_data_frame <- cbind.data.frame(d_TO, d_TE, d_Tt, d_HDD, d_CDD, d_Tmin, d_Tmax, d_Precip, d_Hum, d_Wind, d_CP)
+  
+  # Finally converting date vector and numeric data matrix into timeseries and renaminc columns
+  ts_daily <- timeSeries(daily_data_frame, d_days, format="%Y-%m-%d")  
+  colnames(ts_daily) <- c('TO_C', 'TE_C', 'Tt_C', 'HDD_C', 'CDD_C', 'Tmin_C', 'Tmax_C', 'Precip_in', 'Humidity_pct', 'WindSpeed_MPH', 'CP')
+
+  return(ts_daily)
+}
+
+
+get_upper_tri <- function(cormat){
+  # This function is used to get the upper triangle from a correlation matrix
+  cormat[lower.tri(cormat)]<- NA
+  return(cormat)
+}
+
+reorder_cormat <- function(cormat){
+  # This function is used to reorganize the correlation matrix to improve readability
+  dd <- as.dist((1-cormat)/2)
+  hc <- hclust(dd)
+  cormat <-cormat[hc$order, hc$order]
+}
+
+########################################
+#   DEMAND DATA LOADING & PROCESSING   #
+########################################
+
+# # Loading electricity demand in PS and converting to a daily timeseries
+# ts_daily <- read.raw_data()   #comment to save time, after creating and saving ts_daily_del
+# 
+# # Removing 29th of February    #comment to save time, after creating and saving ts_daily_del
+# length(ts_daily) # supposed to be 5113
+# ts_daily[1155, ]
+# ts_daily[2616, ]
+# ts_daily[4077, ]
+# ts_daily <- ts_daily[-c(1155, 2616, 4077), ]
+# length(ts_daily) # supposed to be 5110
+
+# # Save csv file of daily time series without 29th february
+# write.table(ts_daily, file = "../data/ts_daily_del.csv", row.names=TRUE, col.names=c('mw'), sep=",")
+# 
+# # Imputing outliers
+# ts_daily[2857] <- 107933.86  #comment to save time, after creating and saving ts_daily_del_imp.csv
+# ts_daily[2858] <- 115177.65  #comment to save time, after creating and saving ts_daily_del_imp.csv
+# ts_daily[2859] <- 112667.77  #comment to save time, after creating and saving ts_daily_del_imp.csv
+# ts_daily[2860] <- 113232.09  #comment to save time, after creating and saving ts_daily_del_imp.csv
+# ts_daily[2861] <- 113359.93  #comment to save time, after creating and saving ts_daily_del_imp.csv
+# ts_daily[2862] <- 102053.19  #comment to save time, after creating and saving ts_daily_del_imp.csv
+# ts_daily[2863] <- 103077.70  #comment to save time, after creating and saving ts_daily_del_imp.csv
+# aberrant_2007 <- ts_daily[940] #comment to save time
+# ts_daily[940, ] <- 130530.25   #comment to save time
+
+# ts_daily[2857:2863, ] # double check
+# ts_daily[940, ] # double check
+
+# # Exporting to csv
+# write.table(ts_daily, file = "../data/ts_daily_del_imp.csv", row.names=TRUE, col.names=c('mw'), sep=",")
+
+# Once the daily time series ts_daily_del_imp.csv has been created, we can comment all previous steps
+# and only do this one step to save time
+ts_daily <- read.daily_mw_data(path="../data/ts_daily_del_imp.csv")
+
+
+################################
+#   EXPLORATORY DATA ANALYSIS  #
+################################
+
+# Sets the theme for all plots
+
+theme_set(theme_dark(base_size = 16))
+th <-   theme(
+  plot.title = element_text(color="black", size=20, face="bold.italic", hjust = 0.5),
+  axis.title.x = element_text(color="black", size=14),
+  axis.title.y = element_text(color="black", size=14),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = "grey45"),
+  axis.text.x = element_text(color = "black", size = 12, hjust = .5, vjust = .5),
+  axis.text.y = element_text(color = "black", size = 12, hjust = 1), 
+  panel.grid.major = element_line(color="grey50")
+)
+
+# Reads the csv file (clean)
+
+csv <- read.csv("../data/ts_daily_del_imp.csv", head=FALSE, sep=",", skip=1)
+names(csv) <- c("Date", "Demand")
+day <- as.Date(csv$Date, format="%Y-%m-%d")
+length(csv$Date) # DOIT �TRE 5110 NI PLUS NI MOINS
+
+# Generates the clean plot (2005 to 2018, daily)
+
+ggplot(csv, aes(x = day, y = Demand/1000))  +  
+  ggtitle("Demande quotidienne d'�lectricit�")  + 
+  geom_line(stat = "identity", color="grey0")  + 
+  xlab("Date")  +  
+  ylab("Demande (GW)")  + 
+  scale_x_date(labels = date_format("%Y"), date_breaks="1 year")  +  
+  th
+
+# Reads the csv file (with outliers)
+
+csv_dirty <- read.csv("../data/ts_daily_del.csv", head=FALSE, sep=",", skip=1)
+names(csv_dirty) <- c("Date", "Demand")
+day <- as.Date(csv_dirty$Date, format="%Y-%m-%d")
+length(csv_dirty$Date) # DOIT �TRE 5110 NI PLUS NI MOINS
+
+# Generates the plot (2005 to 2018, daily, with outliers)
+
+ggplot(csv_dirty, aes(x = day, y = Demand/1000))  +  
+  ggtitle("Demande quotidienne d'�lectricit�")  + 
+  geom_line(stat = "identity", color="grey0")  + 
+  stat_valleys(geom = "point", span = 5, ignore_threshold = 0.9, 
+               color="white", size=5, alpha=.3)  + 
+  # stat_valleys(geom = "text", span = 5, ignore_threshold = 0.85, 
+  # x.label.fmt = "Valeur aberrante", 
+  # size = 5, vjust = -0.5, color="black", hjust = -0.15)  + 
+  labs(x = "Date", y = "Demande (GW)")  + 
+  scale_x_date(labels = date_format("%Y"), date_breaks="1 year")  +  
+  th
+
+# Generates the trend 
+
+ggplot(csv, aes(x = day, y = Demand/1000))  +  
+  ggtitle("Tendance entre 2005 et 2018")  + 
+  labs(x = "Date", y = "Demande (GW)")  + 
+  scale_x_date(labels = date_format("%Y"), date_breaks="1 year")  +  
+  stat_smooth(color = "black", fill = "black", method = "loess")  + 
+  th
+
+# Generates the weekly plot and adds a "by week" grouping variable
+
+csv$Week <- as.Date(cut(day, breaks = "week", start.on.monday = FALSE)) 
+
+for(i in 1:nrow(csv)) {
+  csv$Weekday[i] <- weekdays(as.Date(csv$Date[i]))
+}
+
+hlist <- c("USChristmasDay","USGoodFriday","USIndependenceDay","USLaborDay",
+           "USNewYearsDay","USThanksgivingDay", "USElectionDay")     
+
+myholidays  <- dates(as.character(holiday(2005:2018,hlist)),format="Y-M-D")
+
+for(i in 1:nrow(csv)) {
+  csv$Holiday[i] <- is.holiday(as.Date(csv$Date[i]),myholidays)
+}
+
+head(csv, 30)
+
+WeekdayFactor <- factor(csv$Weekday, levels = c("Sunday", "Monday", "Tuesday", "Wednesday", 
+                                                "Thursday", "Friday", "Saturday"))
+
+ggplot(csv, aes(x=WeekdayFactor, y=Demand/1000))  + 
+  ggtitle("Demande d'�lectricit� par jour de la semaine")  + 
+  labs(x = "Jour de la semaine", y = "Demande (GW)")  + 
+  # geom_line(aes(csv$Weekday, group=Week), alpha=0.03, color = "black", size=3)  + 
+  # geom_jitter(color="black", alpha=0.2, size=2, width=.2)  + 
+  # geom_violin(fill = "grey40", color = "#000000", trim=TRUE) + 
+  stat_boxplot(geom ='errorbar', color="black")  + 
+  geom_boxplot(aes(x=WeekdayFactor, y=Demand/1000), color="black", fill="grey70", 
+               outlier.size=0.6, outlier.alpha = 0.2)  + 
+  th 
+
+# Generates the yearly plot and adds a month grouping variable
+
+csv$Month <- format(as.Date(csv$Date), "%m")
+csv$Year <- format(as.Date(csv$Date), "%Y")
+csv$MonthDay <- format(as.Date(csv$Date), "%m-%d")
+
+# MonthFactor <- factor(csv$Month, levels = c("021", "02", "03", "04", "05", "06", "07", 
+# "08", "09", "10", "11", "12")) # can be del i think
+
+ggplot(csv, aes(x=as.Date(MonthDay, format="%m-%d"), y=Demand/1000, group=Year))  + 
+  ggtitle("Demande d'�lectricit� par jour")  + 
+  labs(x = "Mois", y = "Demande (GW)")  + 
+  # geom_point(alpha=.3, size=3, color="white")  + 
+  geom_point(size=3,color=csv$Demand , alpha=0.3)  +  # color=csv$Year
+  # coord_cartesian(xlim = as.Date(c("12-15", "12-31"), format="%m-%d"))  + 
+  scale_x_date(date_breaks="1 month", labels = date_format("%m"))  +  
+  th  + 
+  theme(axis.text.x = element_text(angle = 35, vjust = .7))
+
+# Summons hourly data 
+
+hourly <- read.csv("../data/hrl_load_metered.csv", head=FALSE, sep=",", skip=1) 
+hourly <- hourly[-c(1, 3:6, 8)]
+names(hourly) <- c("Date", "Demand_hour")
+subset <- hourly[67920:69384, ]
+datehour<- as.POSIXct(subset$Date, format="%m/%d/%Y %I:%M:%S %p")
+
+# Generates the plot for the 30th of october 2012, by hour 
+
+plot1 <- ggplot(subset, aes(x = subset$Date, y = subset$Demand_hour))  +  
+  ggtitle("Hourly Electricity Demand During 2012 Crash")  + 
+  geom_line(aes(x = datehour, y = subset$Demand_hour), color="black")  + 
+  labs(x = "Date", y = "Demand (GW)")  + 
+  th
+plot1
+
+# Generates the plot for the 29th of july 2007, by hour 
+
+subset2 <- hourly[22440:22680, ] 
+datehour2<- as.POSIXct(subset2$Date, format="%m/%d/%Y %I:%M:%S %p")
+
+plot2 <- ggplot(subset2, aes(x = subset2$Date, y = subset2$Demand_hour))  +  
+  ggtitle("Hourly Electricity Demand During 2007 Crash")  + 
+  geom_line(aes(x = datehour2, y = subset2$Demand_hour), color="black")  + 
+  labs(x = "Date", y = "Demand (GW)")  + 
+  th
+plot2
+
+# Combines both plots to save space
+
+superplot <- grid.arrange(plot1, plot2, ncol=2)
+
+
+# Generating the plots for holidays
+holiday1 <- csv[349:365, c(2, 7, 8)]
+holiday2 <- csv[714:730, c(2, 7, 8)]
+holiday3 <- csv[1079:1095, c(2, 7, 8)]
+holiday4 <- csv[1444:1460, c(2, 7, 8)]
+holiday5 <- csv[1809:1825, c(2, 7, 8)]
+holiday6 <- csv[2174:2190, c(2, 7, 8)]
+holiday7 <- csv[2539:2555, c(2, 7, 8)]
+holiday8 <- csv[2904:2920, c(2, 7, 8)]
+holiday9 <- csv[3269:3285, c(2, 7, 8)]
+holiday10 <- csv[3634:3650, c(2, 7, 8)]
+holiday11 <- csv[3999:4015, c(2, 7, 8)]
+holiday12 <- csv[4364:4380, c(2, 7, 8)]
+holiday13 <- csv[4729:4745, c(2, 7, 8)]
+holiday14 <- csv[5094:5110, c(2, 7, 8)]
+day1 <- as.Date(holiday1$MonthDay, format="%m-%d")
+day2 <- as.Date(holiday2$MonthDay, format="%m-%d")
+day3 <- as.Date(holiday3$MonthDay, format="%m-%d")
+day4 <- as.Date(holiday4$MonthDay, format="%m-%d")
+day5 <- as.Date(holiday5$MonthDay, format="%m-%d")
+day6 <- as.Date(holiday6$MonthDay, format="%m-%d")
+day7 <- as.Date(holiday7$MonthDay, format="%m-%d")
+day8 <- as.Date(holiday8$MonthDay, format="%m-%d")
+day9 <- as.Date(holiday9$MonthDay, format="%m-%d")
+day10 <- as.Date(holiday10$MonthDay, format="%m-%d")
+day11 <- as.Date(holiday11$MonthDay, format="%m-%d")
+day12 <- as.Date(holiday12$MonthDay, format="%m-%d")
+day13 <- as.Date(holiday13$MonthDay, format="%m-%d")
+day14 <- as.Date(holiday14$MonthDay, format="%m-%d")
+class(day12)
+holiday14
+length(holiday13$MonthDay)
+ggplot(holiday1, aes(x = MonthDay, y = Demand/1000, group=Year))  +  
+  ggtitle("Demande quotidienne d'�lectricit�")  + 
+  geom_line(stat = "identity", color="grey0")  + 
+  geom_line(aes(holiday2$MonthDay, y=holiday2$Demand/1000))  + 
+  geom_line(aes(holiday3$MonthDay, y=holiday3$Demand/1000))  + 
+  geom_line(aes(holiday4$MonthDay, y=holiday4$Demand/1000))  + 
+  geom_line(aes(holiday5$MonthDay, y=holiday5$Demand/1000))  + 
+  geom_line(aes(holiday6$MonthDay, y=holiday6$Demand/1000))  + 
+  geom_line(aes(holiday7$MonthDay, y=holiday7$Demand/1000))  + 
+  geom_line(aes(holiday8$MonthDay, y=holiday8$Demand/1000))  + 
+  geom_line(aes(holiday9$MonthDay, y=holiday9$Demand/1000))  + 
+  geom_line(aes(holiday10$MonthDay, y=holiday10$Demand/1000))  + 
+  geom_line(aes(holiday11$MonthDay, y=holiday11$Demand/1000))  + 
+  geom_line(aes(holiday12$MonthDay, y=holiday12$Demand/1000))  + 
+  geom_line(aes(holiday13$MonthDay, y=holiday13$Demand/1000))  + 
+  geom_vline(aes(xintercept = 11), color="white", size=39.5, alpha=0.15)  + 
+  # geom_line(aes(x=day14, y=holiday14$Demand/1000, group=MonthDay))  + 
+  # scale_x_discrete(breaks = 1:31)
+  xlab("Date")  +  
+  ylab("Demande (GW)")  + 
+  th
+
+# Generates the clean plot (2005 to 2018, daily)
+
+ggplot(csv, aes(x = day, y = Demand/1000))  +  
+  ggtitle("Demande quotidienne d'�lectricit�")  + 
+  geom_line(group=csv$Year)  + 
+  xlab("Date")  +  
+  coord_cartesian(xlim = c(325, 500))  + 
+  ylab("Demande (GW)")  + 
+  scale_x_date(labels = date_format("%Y"), breaks="1 year")  +  
+  th
+
+# Generates boxplot of f�ri� vs pas f�ri�
+
+ggplot(csv, aes(y=Demand/1000, x=Holiday))  + 
+  ggtitle("Demande d'�lectricit� par jour selon f�ri� ou pas")  + 
+  stat_boxplot(geom ='errorbar', color="black")  + 
+  geom_boxplot(color="black", fill="grey70", outlier.size=0.6, outlier.alpha = 0.2)  +  
+  labs(x = "Type de journ�e", y = "Demande (GW)")  +  
+  scale_x_discrete(labels=c("Pas f�ri�","F�ri�"))  + 
+  th  + 
+  theme(axis.text.x = element_text(vjust = .7))
+
+
+###########################
+#   FEATURE ENGINEERING   #    #Uncomment the below if running for first time. Otherwise, leave commented and load daily ts directly
+###########################
+
+# # Reading the weather data, which comes in two csv files: #1 for years 2005-2009  +  #2 for years 2009-2019
+# wea1 <- read.csv("../data/WBAN_54743_2005_2009.csv", sep=",", na.strings=c("","NA"), stringsAsFactors = FALSE)
+# wea2 <- read.csv("../data/WBAN_54743_2009_2019.csv", sep=",",  na.strings=c("","NA"), stringsAsFactors = FALSE)
+# 
+# # Concatenating so that the date for the 13 years are in one vector (for each variable)
+# nj.wea.day <- c(as.Date(wea1$DATE, "%Y-%m-%d %H:%M"), as.Date(wea2$DATE, "%Y-%m-%d %H:%M"))
+# nj.wea.datetime <- c(as.character(wea1$DATE), as.character(wea2$DATE))
+# nj.wea.temp <- c(as.numeric(wea1$HOURLYDRYBULBTEMPC), as.numeric(wea2$HOURLYDRYBULBTEMPC))
+# nj.wea.precip <- c(as.numeric(wea1$HOURLYPrecip), as.numeric(wea2$HOURLYPrecip))
+# nj.wea.hum <- c(as.numeric(wea1$HOURLYRelativeHumidity), as.numeric(wea2$HOURLYRelativeHumidity))
+# nj.wea.wind <-c(as.numeric(wea1$HOURLYWindSpeed), as.numeric(wea2$HOURLYWindSpeed))
+# 
+# 
+# # Building data frame out of numeric data to look for missing values
+# wea_data_frame <- cbind.data.frame(nj.wea.temp, nj.wea.precip, nj.wea.hum, nj.wea.wind)
+# summary(wea_data_frame)  # 5362 NAs in temp, 37935 NAs in precip, 6131 NAs in hum, 5555 NAs in wind
+# 
+# 
+# # Replacing NAs elements in temperature and humidity with previous values
+# wea_data_frame$nj.wea.hum <- na.locf(wea_data_frame$nj.wea.hum)
+# wea_data_frame$nj.wea.temp <- na.locf(wea_data_frame$nj.wea.temp)
+# summary(wea_data_frame)
+# 
+# 
+# # Replacing NAs in precipitation and wind with 0
+# for(i in 1:length(wea_data_frame$nj.wea.precip)) {
+#   if (is.na(wea_data_frame$nj.wea.precip[i])) {
+#     wea_data_frame$nj.wea.precip[i] <- 0
+#   }
+#   if (is.na(wea_data_frame$nj.wea.wind[i])) {
+#     wea_data_frame$nj.wea.wind[i] <- 0
+#   }
+# }
+# summary(wea_data_frame)
+# 
+# # Creating time series
+# wea_ts_hourly <- timeSeries(wea_data_frame, nj.wea.datetime, format="%Y-%m-%d %H:%M")
+# colnames(wea_ts_hourly) <- c('Temp_C', 'Precip_in', 'Humidity_pct', 'WindSpeed_MPH')
+# 
+# # Converting hourly time series into daily time series, while also creating all feature variables
+# wea_ts_daily <- wea_hourly_to_daily(wea_ts_hourly, nj.wea.day, 18.3, 13.5) #comment if this step was done already
+# 
+# # Removing 2019 to be consistent with electricity demand
+# wea_ts_daily <- wea_ts_daily[-seq(5109, 5139),]
+# 
+# # Removing February 29th to be consistent with electricity demand
+# wea_ts_daily[1155, ]
+# wea_ts_daily[2616, ]
+# wea_ts_daily[4072, ]
+# wea_ts_daily <- wea_ts_daily[-c(1155, 2616, 4072), ]
+# length(wea_ts_daily$TO_C) #supposed to be 5110, we are missing 5 values
+# 
+# # Imputing missing days from October 30th 2012 to November 4th 2012 (inclusively)
+# ts_daily <- read.daily_mw_data(path="../data/ts_daily_del_imp.csv")
+# mw_df_daily <- data.frame(ts_daily) #loading demand dataframe so that we can impute the row names into the wea_df_daily
+# wea_df_daily <- data.frame(wea_ts_daily)
+# last_row <- wea_df_daily[2857,]
+# wea_df_daily <- rbind(wea_df_daily[1:2857,], last_row, last_row, last_row, last_row, last_row, wea_df_daily[2858:5105,])
+# wea_df_daily[2855:2869,] #it worked, but we need to change the date
+# row.names(wea_df_daily) <- row.names(mw_df_daily)
+# wea_df_daily[2855:2869,] #it worked,
+# #index(wea_df_daily[2855,]) #it worked
+# 
+# ## Converting wea_df_daily back into a time series
+# wea_ts_daily <- timeSeries(wea_df_daily, row.names(wea_df_daily), format="%Y-%m-%d")
+# length(wea_ts_daily$TO_C)
+# summary(wea_ts_daily)
+# 
+# # Saving daily time series into csv file
+# write.table(wea_ts_daily, file = "../data/weather_ts_daily.csv", row.names=TRUE,
+#             col.names=c('TO_C', 'TE_C', 'Tt_C', 'HDD_C', 'CDD_C', 'Tmin_C', 'Tmax_C',
+#                         'Precip_in', 'Humidity_pct', 'WindSpeed_MPH', 'CP'), sep=",")
+
+# Read wea_ts_daily if this was generated already, read ts_daily, create two dataframes and merge them
+wea_ts_daily <- read.daily_weather_data(path="../data/weather_ts_daily.csv") #comment if this step was not done already
+#length(wea_ts_daily$TO_C)
+ts_daily <- read.daily_mw_data(path="../data/ts_daily_del_imp.csv")
+mw_df_daily <- data.frame(ts_daily)
+wea_df_daily <- data.frame(wea_ts_daily)
+combined_df <- merge(mw_df_daily, wea_df_daily, by="row.names")
+
+# Statistics for training set
+summary(combined_df[1:3285,])
+boxplot(combined_df[1:3285,3:7], sub="summary training set" )
+boxplot(combined_df[1:3285,8:12], sub="summary training set" )
+
+# Statistics for validation set
+summary(combined_df[3286:4380,])
+boxplot(combined_df[3286:4380,3:7],sub="summary validation set")
+boxplot(combined_df[3286:4380,8:12],sub="summary validation set")
+
+# Statistics for test set
+summary(combined_df[4381:5110,])
+boxplot(combined_df[4381:5110,3:7],sub="summary test set")
+boxplot(combined_df[4381:5110,8:12],sub="summary test set")
+
+#Statisitcs sur l'ensemble des observations
+boxplot(combined_df[1:5110,3:7],sub="summary total set")
+boxplot(combined_df[1:5110,8:13],sub="summary total set")
+
+# Plotting effect of temperature on demand
+plot(wea_ts_daily[1:3285,]$TO_C, ts_daily[1:3285,]$mw,
+     ylab="daily demand in PS (MWh)",
+     xlab="Temperature (deg Celsius)",pch=23)
+
+# Plotting effect of humidity on demand
+plot(wea_ts_daily[1:3285,]$Humidity_pct, ts_daily[1:3285,]$mw,
+     ylab="daily demand in PS (MWh)",
+     xlab="Humidity (pct))",pch=23)
+
+# Plotting effect of precipitation on demand
+plot(wea_ts_daily[1:3285,]$Precip_in, ts_daily[1:3285,]$mw,
+     ylab="daily demand in PS (MWh)",
+     xlab="Precipitation (in))",pch=23)
+
+# Plotting effect of windspeed on demand
+plot(wea_ts_daily[1:3285,]$WindSpeed_MPH, ts_daily[1:3285,]$mw,
+     ylab="daily demand in PS (MWh)",
+     xlab="Wind Speed (MPH)",pch=23)
+
+# Plotting effect of windchilling factor on demand
+plot(wea_ts_daily[1:3285,]$CP, ts_daily[1:3285,]$mw,
+     ylab="Demande (MWh)",
+     xlab="Refroidissement du Vent",pch=23)
+
+# Plotting effect of Heating Degree Days on demand
+plot(wea_ts_daily[1:3285,]$HDD_C, ts_daily[1:3285,]$mw,
+     ylab="Demande (MWh)",
+     xlab="Heating Degree Days (C)",pch=23)
+
+# Plotting effect of Cooling Degree Days on demand
+plot(wea_ts_daily[1:3285,]$CDD_C, ts_daily[1:3285,]$mw,
+     ylab="Demande (MWh)",
+     xlab="Cooling Degree Days (C)",pch=23)
+
+# Creating a correlation matrix
+combined_df2 <- combined_df[c(1:3285), -c(1,5,8,9)]
+cormat <- round(cor(combined_df2, method="pearson"), 2)
+#cormat <- reorder_cormat(cormat)
+upper_tri <- get_upper_tri(cormat)
+melted_cormat <- melt(upper_tri, na.rm = TRUE)
+
+# Printing heatmap from correlation matrix
+ggheatmap <- ggplot(melted_cormat, aes(Var2, Var1, fill = value)) + 
+  geom_tile(color = "black") + 
+  scale_fill_gradient2(low = "#56B4E9", high = "#E69F00", mid = "white", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab",
+                       name="Pearson\nCorrelation")  + 
+  theme_set(theme_dark(base_size = 12))  + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+                                   size = 12, hjust = 1)) + 
+  coord_fixed()
+ggheatmap  +  
+  geom_text(aes(Var2, Var1, label = value), color = "black", size = 3)  + 
+  ggtitle("Correlation Heatmap")  + 
+  geom_line(stat = "identity", color="grey100")  + 
+  theme(
+    plot.title = element_text(color="black", size=20, face="bold.italic", hjust = 0.5),
+    axis.title.x = element_text(color="white", size=14),
+    axis.title.y = element_text(color="white", size=14),
+    panel.grid.major = element_blank(),
+    axis.text.x = element_text(angle = 45, vjust = 1, size = 12, hjust = 1),
+    axis.text.y = element_text(color = "black", size = 12, angle = 0, hjust = 1), 
+    panel.grid.minor = element_line(colour="grey45"),
+    #panel.border = element_blank(),
+    #panel.background = element_blank(),
+    axis.ticks = element_blank(),
+    legend.justification = c(1, 0),
+    legend.position = c(0.6, 0.7),
+    legend.direction = "horizontal",
+    legend.title = element_text(colour = "white", size=10),
+    legend.key = element_rect(colour = "white", fill="grey45"),
+    legend.text=element_text(color="white",size=10),
+    legend.background = element_rect(fill="transparent")) + 
+    guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                               title.position = "top", title.hjust = 0.5))
+
+combined_df <- combined_df[c(1:5110), -c(3,4,5,8,9,10,11,12)]
+
+
+
+write.csv(combined_df, file="../data/all_var_df.csv", row.names = FALSE)
+
+
+
+
+#####################
+#   NAIVE METHODS   #
+#####################
+
+# Converting time series into data frame
+df_daily <- data.frame(Date=as.Date(time(ts_daily)), mw=ts_daily, row.names=NULL)
+
+# Computing (1) no-change model forecast
+naive1 <- df_daily[[2]][-length(df_daily[[2]])]
+observed1 <- df_daily[[2]][-1]
+
+# Preparing subset for ggplot
+subset_naive1 = csv
+subset_naive1 = subset_naive1[-1, ]
+subset_naive1$naive1 = naive1
+subset_naive1$Date <- as.Date(subset_naive1$Date)
+subset_naive1_jun_2015 = subset_naive1[3801:3830, ]
+
+# Computing bias and MAPE - on validation set
+bias1 <- mean(naive1[3285:4379]-observed1[3285:4379])
+pbias1 <- mean((naive1[3285:4379]-observed1[3285:4379])/observed1[3285:4379])*100
+mape1 <- mean(abs((naive1[3285:4379]-observed1[3285:4379])/observed1[3285:4379]))*100
+
+# Remove 29 February
+df_daily2 <- list()  #first we need to create a list df_daily2
+df_daily2[[1]] <-
+  df_daily[[1]][substr(as.character(df_daily[[1]]),6,10)!="02-29"]
+df_daily2[[2]] <- 
+  df_daily[[2]][substr(as.character(df_daily[[1]]),6,10)!="02-29"]
+
+df_daily2 <- data.frame(Date=df_daily2[[1]], mw=df_daily2[[2]])  #converting back into a dataframe
+
+# Computing (2) no-change yearly seasonal model forecast
+# (We thus have no forecast for the first year of observed data.)
+naive2    <- df_daily[[2]][-((length(df_daily[[2]])-364):length(df_daily[[2]]))]
+observed2 <- df_daily[[2]][-(1:365)]
+
+# Preparing subset for ggplot
+subset_naive2 = csv
+subset_naive2 = subset_naive2[-c(1:365), ]
+subset_naive2$naive2 = naive2
+subset_naive2$Date <- as.Date(subset_naive2$Date)
+subset_naive2_jun_2015 = subset_naive2[3437:3466, ] 
+
+# Computing bias and MAPE
+bias2 <- mean(naive2[2921:4015]-observed2[2921:4015])
+pbias2 <- mean((naive2[2921:4015]-observed2[2921:4015])/observed2[2921:4015])*100
+mape2 <- mean(abs((naive2[2921:4015]-observed2[2921:4015])/observed2[2921:4015]))*100
+
+# Computing (3) rolling three-day window
+#daily.ts <- timeSeries(df_daily[[2]],df_daily[[1]])  #first converting to time series
+naive3 <- rollMean(ts_daily,3,align= "right" ,na.pad = TRUE)[-(1:2)]
+naive3 <- naive3[-length(naive3)]
+observed3 <- df_daily[[2]][-(1:3)]
+
+# Preparing subset for ggplot
+subset_naive3 = csv
+subset_naive3 = subset_naive3[-c(1:3), ]
+subset_naive3$naive3 = naive3
+subset_naive3$Date <- as.Date(subset_naive3$Date)
+subset_naive3_jun_2015 = subset_naive3[3799:3828, ]
+
+
+# Computing bias and MAPE
+bias3 <- mean(naive3[3283:4377]-observed3[3283:4377])
+pbias3 <- mean((naive3[3283:4377]-observed3[3283:4377])/observed3[3283:4377])*100
+mape3 <- mean(abs((naive3[3283:4377]-observed3[3283:4377])/observed3[3283:4377]))*100
+
+# Computing (4) no-change last week model forecast
+# (We thus have no forecast for the first week of observed data.)
+naive4    <- df_daily[[2]][-((length(df_daily[[2]])-6):length(df_daily[[2]]))]
+observed4 <- df_daily[[2]][-(1:7)]
+
+# Preparing subset for ggplot
+subset_naive4 = csv
+subset_naive4 = subset_naive4[-c(1:7), ]
+subset_naive4$naive4 = naive4
+subset_naive4$Date <- as.Date(subset_naive4$Date)
+subset_naive4_jun_2015 = subset_naive4[3795:3824, ]
+
+
+# Computing bias and MAPE
+bias4 <- mean(naive4[3279:4373]-observed4[3279:4373])
+pbias4 <- mean((naive4[3279:4373]-observed4[3279:4373])/observed4[3279:4373])*100
+mape4 <- mean(abs((naive4[3279:4373]-observed4[3279:4373])/observed4[3279:4373]))*100
+
+
+# Comparing 4 naive methods from 2014 to 2016
+cat("Results for 2014-2016\n")
+cat("no-change model: bias=",bias1,
+    "%bias=",pbias1,"mape=",mape1,"\n")
+cat("seasonal no-change model: bias=",bias2,
+    "%bias=",pbias2,"mape=",mape2,"\n")
+cat("rolling three-day window: bias=",bias3,
+    "%bias=",pbias3,"mape=",mape3,"\n\n")
+cat("same day last week model: bias=",bias4,
+    "%bias=",pbias4,"mape=",mape4,"\n\n")
+
+#Comparing 3 methods just for the last 365 days
+n1 <- length(naive1)
+y2016 <- (n1-364):n1
+bias1.1 <- mean(naive1[y2016]-observed1[y2016])
+pbias1.1 <- mean((naive1[y2016]-observed1[y2016])/observed1[y2016])*100
+mape1.1 <- mean(abs((naive1[y2016]-observed1[y2016])/observed1[y2016]))*100
+
+n2 <- length(naive2)
+y2016 <- (n2-364):n2
+bias2.1 <- mean(naive2[y2016]-observed2[y2016])
+pbias2.1 <- mean((naive2[y2016]-observed2[y2016])/observed2[y2016])*100
+mape2.1 <- mean(abs((naive2[y2016]-observed2[y2016])/observed2[y2016]))*100
+
+n3 <- length(naive3)
+y2016 <- (n3-364):n3
+bias3.1 <- mean(naive3[y2016]-observed3[y2016])
+pbias3.1 <- mean((naive3[y2016]-observed3[y2016])/observed3[y2016])*100
+mape3.1 <- mean(abs((naive3[y2016]-observed3[y2016])/observed3[y2016]))*100
+
+# Plotting naive methods for June 2015
+ggplot(subset_naive1_jun_2015, aes(x=subset_naive1_jun_2015$Date, y=
+                                     subset_naive1_jun_2015$Demand/1000))  +  
+  ggtitle("M�thodes de pr�vision (juin 2015)")  + 
+  
+  geom_point(size=4, shape=18)  + 
+  geom_area(stat = "identity", color="grey0", alpha=0.4)  + 
+  
+  geom_line(aes(y=subset_naive1_jun_2015$naive1/1000), color="darkblue")  + 
+  geom_point(aes(y=subset_naive1_jun_2015$naive1/1000), color="darkblue", 
+             alpha=1, size=3, shape=17)  + 
+  
+  geom_line(aes(y=subset_naive2_jun_2015$naive2/1000), color="darkgreen")  + 
+  geom_point(aes(y=subset_naive2_jun_2015$naive2/1000), color="darkgreen", 
+             size=3, shape=15)  +  
+  
+  geom_line(aes(y=subset_naive3_jun_2015$naive3/1000), color="darkorange")  + 
+  geom_point(aes(y=subset_naive3_jun_2015$naive3/1000), color="darkorange", 
+             size=3, shape=16)  + 
+  
+  geom_line(aes(y=subset_naive4_jun_2015$naive4/1000), color="darkred")  + 
+  geom_point(aes(y=subset_naive4_jun_2015$naive4/1000), color="darkred", 
+             size=3, shape=25, fill="darkred")  + 
+  
+  xlab("Date")  +  
+  ylab("Demande (GW)")  + 
+  coord_cartesian(ylim=c(75,200))  + 
+  scale_x_date(labels = date_format("%d %b %Y"), breaks="5 days", 
+               minor_breaks = "1 day", expand = c(0, 0))  +  
+  th  +  
+  theme(panel.grid.minor = element_line(color="grey50",
+        size=0.3),
+        axis.text.x = element_text(vjust = .7),
+        legend.justification = c(1, 0),
+        legend.position = c(0.6, 0.7),
+        legend.direction = "horizontal",
+        legend.title = element_text(colour = "white", size=10),
+        legend.key = element_rect(colour = "white", fill="grey45"),
+        legend.text=element_text(color="white",size=10),
+        legend.background = element_rect(fill="transparent"))
+
+
+#############################
+#   EXPONENTIAL SMOOTHING   #
+#############################
+# 
+# 
+ ts_daily <- read.daily_mw_data(path="../data/ts_daily_del_imp.csv")
+# 
+# creating training set (2005-2013)
+in.sample <- window(ts_daily, as.Date("2005-01-01"), as.Date("2013-12-31"))
+in.sample.df <- data.frame(in.sample)
+# # 
+# ### Double Seasonal Holt-Winters Forecasting Method ###
+#
+# Creating msts objects so that dshw recognizes these two periods
+# automatically.
+# Periods: 7 for week since we have daily data
+#          365 for year since we have daily data
+in.sample.msts <- msts(in.sample.df,seasonal.periods=c(7,364))
+
+# Training a dshw smoothing model on the in.sample
+start_time <- Sys.time()
+fit <- dshw(in.sample.msts, h=1)
+end_time <- Sys.time()
+print(end_time - start_time) # 2.793 min
+
+# Printing description of fitted model
+sink("dshw.fit.out")
+summary(fit)
+sink()
+
+
+# Plotting several graphs to see whether the seasonal pattern is well captured in a year forecast and for several weeks. 
+# This is just a verification exercise, as this project is not interested in forecasting in mid/long term horizon, only
+# forecasting the next day.
+
+# EXEMPLE 2013 � 2015
+in.sample <- window(ts_daily, as.Date("2005-01-01"), as.Date("2013-12-31"))
+in.sample.df <- data.frame(in.sample)
+in.sample.msts <- msts(in.sample.df,seasonal.periods=c(7,364))
+
+fcast_dshw_example_2014 <- dshw(in.sample.msts, h=364, model=fit)
+
+validation_2014 <- window(ts_daily, as.Date("2014-01-01"), as.Date("2014-12-30"))
+# Plot forecast and add observed data to compare (for one year).
+plot(fcast_dshw_example_2014, xlim=c(9,11),
+     ylab="Demande(MWh)", main="M�thode de lissage DSHW (2013-2015)", xaxt = "n")
+lines(seq((10 + 9/364),(10 + 373/364),length=364),validation_2014,col="red")
+axis(1, at=c(9, 10, 11), labels=c('2013', '2014', '2015'))
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","red"))
+
+# EXEMPLE 2014 � 2016
+in.sample <- window(ts_daily, as.Date("2005-01-01"), as.Date("2014-12-31"))
+in.sample.df <- data.frame(in.sample)
+in.sample.msts <- msts(in.sample.df,seasonal.periods=c(7,364))
+
+fcast_dshw_example_2015 <- dshw(in.sample.msts, h=364, model=fit)
+
+validation_2015 <- window(ts_daily, as.Date("2015-01-01"), as.Date("2015-12-30"))
+# Plot forecast and add observed data to compare (for one year).
+plot(fcast_dshw_example_2015, xlim=c(10,12), xaxt = "n",
+     ylab="Demande(MWh)", main="M�thode de lissage DSHW (2014-2016)", ylim=c(80000, 200000))
+lines(seq((11 + 9/364),(11 + 373/364),length=364),validation_2015,col="red")
+axis(1, at=c(10, 11, 12), labels=c('2014', '2015', '2016'))
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","red"))
+
+# EXEMPLE HIVER 2014
+in.sample <- window(ts_daily, as.Date("2005-01-01"), as.Date("2013-12-31"))
+in.sample.df <- data.frame(in.sample)
+in.sample.msts <- msts(in.sample.df,seasonal.periods=c(7,364))
+
+fcast_dshw_example_hiv_2014 <- dshw(in.sample.msts, h=364, model=fit)
+
+validation_hiv_2014 <- window(ts_daily, as.Date("2014-01-01"), as.Date("2014-12-30"))
+# Plot forecast and add observed data to compare (for one year).
+plot(fcast_dshw_example_hiv_2014, xlim=c(10-(31-9)/364, 10 + (31 + 9)/364), xaxt = "n",
+     ylab="Demande(MWh)", main="M�thode de lissage DSHW (Dec 2013 - Jan 2014)", ylim=c(100000, 160000))
+lines(seq((10 + 9/364),(10 + 373/364),length=364),validation_hiv_2014,col="red")
+axis(1, at=c(9.95, 10.025, 10.10), labels=c('01 Dec 2013', '01 Jan 2014', '01 Fev 2014'))
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","red"))
+
+# EXEMPLE ETE 2014
+in.sample <- window(ts_daily, as.Date("2005-01-01"), as.Date("2014-07-31"))
+in.sample.df <- data.frame(in.sample)
+in.sample.msts <- msts(in.sample.df,seasonal.periods=c(7,364))
+
+fcast_dshw_example_ete_2014 <- dshw(in.sample.msts, h=364, model=fit)
+
+validation_ete_2014 <- window(ts_daily, as.Date("2014-08-01"), as.Date("2014-09-30"))
+# Plot forecast and add observed data to compare (for one year).
+plot(fcast_dshw_example_ete_2014, xlim=c(10 + (181 + 10)/364, 10 + (242 + 10)/364),xaxt = 'n',
+     ylab="Demande(MWh)", main="M�thode de lissage DSHW (Juil 2014 - Ao�t 2014)")
+lines(seq((10 + (212 + 9)/364), (10 + (273 + 9)/364),length=61),validation_ete_2014,col="red")
+axis(1, at=c((10 + (181 + 10)/364), (10 + (212 + 10)/364), (10 + (242 + 10)/364)), labels=c('01 Juil 2014', '01 Ao�t 2014', '01 Sept 2014'))
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","red"))
+
+# # The dshw model will now be used to make predictions on day ahead, for all days in the 
+# # validation set. This procedure will be to march forward one step after each forecast, 
+# # adjust the in.sample to include the new observation, and make another forecast for the next day.
+# 
+# # # creating initial validation set (2014-2016), i.e. for the first prediction
+# out.sample <- window(ts_daily, as.Date("2014-01-01"), as.Date("2016-12-31"))
+# # #out.sample <- window(ts_daily, as.Date("2014-01-01"), as.Date("2014-01-31"))
+# # 
+# # initializaing fcast
+# dshw_forecast <- numeric()
+# day_fcast <- character()
+# class(day_fcast) <- "Date"
+
+# start_time <- Sys.time()
+# 
+# for (i in 1:length(out.sample)) {
+#   in.sample <- window(ts_daily, as.Date("2005-01-01"), as.Date(time(out.sample[i,]))-1)
+#   in.sample.df <- data.frame(in.sample)
+#   # Creating msts objects so that dshw recognizes these two periods
+#   # automatically.
+#   # Periods: 7 for week since we have daily data
+#   #          365 for year since we have daily data
+#   in.sample.msts <- msts(in.sample.df,seasonal.periods=c(7,364))
+#   dshw_forecast[i] <- dshw(in.sample.msts, h=1, model=fit)[[1]][[1]]
+#   day_fcast[i] <- as.Date(time(out.sample[i,]))
+# }
+# 
+# dshw_forecast_df <- data.frame(dshw_forecast)
+# day_fcast_df <- data.frame(day_fcast)
+# 
+# ts_fcast <- timeSeries(dshw_forecast_df, as.character(day_fcast), format="%Y-%m-%d")
+# 
+# end_time <- Sys.time()
+# print(end_time - start_time)
+# 
+# write.table(ts_fcast, file = "../data/dshw.csv", row.names=TRUE,
+#             col.names=c('mw'), sep=",")
+
+ts_fcast <- read.dshw_data()
+
+# Computing errors on dshw
+dshw_bias <- mean(ts_fcast-out.sample)
+dshw_pbias <- mean((ts_fcast-out.sample)/out.sample)*100
+dshw_mape <- mean(abs((ts_fcast-out.sample)/out.sample))*100
+
+dshw_bias/1000 # en GW
+dshw_pbias
+dshw_mape
+
+# Plotting several graphs to compare observation to dshw prediction
+
+# EXEMPLE WIN 2014
+ts.to.plot <- window(ts_daily, as.Date("2014-01-01"), as.Date("2014-03-01"))
+fcast.to.plot <- window(ts_fcast, as.Date("2014-01-01"), as.Date("2014-03-01"))
+
+plot(ts.to.plot, xlab='Date', ylab='Demande(MWh)', main='DSHW pr�vision vs observation (Hiver 2014)')
+lines(fcast.to.plot, col='blue')
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","black"))
+
+# EXEMPLE ETE 2014
+ts.to.plot <- window(ts_daily, as.Date("2014-06-01"), as.Date("2014-09-01"))
+fcast.to.plot <- window(ts_fcast, as.Date("2014-06-01"), as.Date("2014-09-01"))
+
+plot(ts.to.plot, xlab='Date', ylab='Demande(MWh)', main='DSHW pr�vision vs observation (�t� 2014)')
+lines(fcast.to.plot, col='blue')
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","black"))
+
+# EXEMPLE WIN 2015
+ts.to.plot <- window(ts_daily, as.Date("2015-01-01"), as.Date("2015-03-01"))
+fcast.to.plot <- window(ts_fcast, as.Date("2015-01-01"), as.Date("2015-03-01"))
+
+plot(ts.to.plot, xlab='Date', ylab='Demande(MWh)', main='DSHW pr�vision vs observation (Hiver 2015)')
+lines(fcast.to.plot, col='blue')
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","black"))
+
+# EXEMPLE ETE 2015
+ts.to.plot <- window(ts_daily, as.Date("2015-06-01"), as.Date("2015-09-01"))
+fcast.to.plot <- window(ts_fcast, as.Date("2015-06-01"), as.Date("2015-09-01"))
+
+plot(ts.to.plot, xlab='Date', ylab='Demande(MWh)', main='DSHW pr�vision vs observation (�t� 2015)')
+lines(fcast.to.plot, col='blue')
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","black"))
+
+
+### TBATS ###
+
+# Creating msts
+in.sample <- window(ts_daily, as.Date("2005-01-01"), as.Date("2013-12-31"))
+in.sample.df <- data.frame(in.sample)
+in.sample.msts <- msts(in.sample.df,seasonal.periods=c(7,365))
+
+# Training a tbats smoothing model on the in.sample
+start_time <- Sys.time()
+tbats.fit <- tbats(in.sample.msts)
+end_time <- Sys.time()
+print(end_time - start_time)
+
+# Printing description of fitted model
+sink("tbats.fit.out")
+print(tbats.fit)
+sink()
+
+
+
+# Plotting several graphs to see whether the seasonal pattern is well captured in a year forecast and for several weeks. 
+# This is just a verification exercise, as this project is not interested in forecasting in mid/long term horizon, only
+# forecasting the next day.
+
+# EXEMPLE 2013 � 2015
+in.sample <- window(ts_daily, as.Date("2005-01-01"), as.Date("2013-12-31"))
+in.sample.df <- data.frame(in.sample)
+in.sample.msts <- msts(in.sample.df,seasonal.periods=c(7,365))
+
+fcast_tbats_example_2014 <- forecast(in.sample.msts, h=365, model=tbats.fit)
+plot(fcast_tbats_example_2014)
+
+validation_2014 <- window(ts_daily, as.Date("2014-01-01"), as.Date("2014-12-31"))
+# Plot forecast and add observed data to compare (for one year).
+plot(fcast_tbats_example_2014, xlim=c(9,11),
+     ylab="Demande(MWh)", main="M�thode de lissage tbats (2013-2015)", xaxt = "n")
+lines(seq(10,11,length=365),validation_2014,col="red")
+axis(1, at=c(9, 10, 11), labels=c('2013', '2014', '2015'))
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","red"))
+
+# EXEMPLE 2014 � 2016
+in.sample <- window(ts_daily, as.Date("2005-01-01"), as.Date("2014-12-31"))
+in.sample.df <- data.frame(in.sample)
+in.sample.msts <- msts(in.sample.df,seasonal.periods=c(7,365))
+
+fcast_tbats_example_2015 <- forecast(in.sample.msts, h=365, model=tbats.fit)
+
+validation_2015 <- window(ts_daily, as.Date("2015-01-01"), as.Date("2015-12-31"))
+# Plot forecast and add observed data to compare (for one year).
+plot(fcast_tbats_example_2015, xlim=c(10,12), xaxt = "n",
+     ylab="Demande(MWh)", main="M�thode de lissage tbats (2014-2016)", ylim=c(80000, 200000))
+lines(seq(11,12,length=365),validation_2015,col="red")
+axis(1, at=c(10, 11, 12), labels=c('2014', '2015', '2016'))
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","red"))
+
+# EXEMPLE HIVER 2014
+in.sample <- window(ts_daily, as.Date("2005-01-01"), as.Date("2013-12-31"))
+in.sample.df <- data.frame(in.sample)
+in.sample.msts <- msts(in.sample.df,seasonal.periods=c(7,365))
+
+fcast_tbats_example_hiv_2014 <- forecast(in.sample.msts, h=365, model=tbats.fit)
+
+validation_hiv_2014 <- window(ts_daily, as.Date("2014-01-01"), as.Date("2014-12-31"))
+# Plot forecast and add observed data to compare (for one year).
+plot(fcast_tbats_example_hiv_2014, xlim=c(10-(31)/365, 10 + (31)/365), xaxt = "n",
+     ylab="Demande(MWh)", main="M�thode de lissage tbats (Dec 2013 - Jan 2014)", ylim=c(100000, 160000))
+lines(seq((10),(11),length=365),validation_hiv_2014,col="red")
+axis(1, at=c(9.95, 10.025, 10.10), labels=c('01 Dec 2013', '01 Jan 2014', '01 Fev 2014'))
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","red"))
+
+# EXEMPLE ETE 2014
+in.sample <- window(ts_daily, as.Date("2005-01-01"), as.Date("2014-07-31"))
+in.sample.df <- data.frame(in.sample)
+in.sample.msts <- msts(in.sample.df,seasonal.periods=c(7,365))
+
+fcast_tbats_example_ete_2014 <- forecast(in.sample.msts, h=365, model=tbats.fit)
+
+validation_ete_2014 <- window(ts_daily, as.Date("2014-08-01"), as.Date("2014-09-30"))
+# Plot forecast and add observed data to compare (for one year).
+plot(fcast_tbats_example_ete_2014, xlim=c(10 + (181)/365, 10 + (242)/365),xaxt = 'n',
+     ylab="Demande(MWh)", main="M�thode de lissage tbats (Juil 2014 - Ao�t 2014)")
+lines(seq((10 + (212)/365), (10 + (273)/365),length=61),validation_ete_2014,col="red")
+axis(1, at=c((10 + (181)/365), (10 + (212)/365), (10 + (242)/365)), labels=c('01 Juil 2014', '01 Ao�t 2014', '01 Sept 2014'))
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","red"))
+
+
+# Moving the rolling window of in.sample to predict one step ahead (i.e. one day ahead).
+# i.e. forecasting only one day ahead. Then marching forward one step (i.e. one day)
+# adjusting the in.sample and making another forecast for the next day.
+# 
+# # initializaing fcast
+# TBATS_forecast <- numeric()
+# day_fcast <- character()
+# class(day_fcast) <- "Date"
+# 
+# start_time <- Sys.time()
+# 
+# for (i in 1:length(out.sample)) {
+#   in.sample <- window(ts_daily, as.Date("2005-01-01"), as.Date(time(out.sample[i,]))-1)
+#   in.sample.df <- data.frame(in.sample)
+#   # Creating msts objects so that dshw recognizes these two periods
+#   # automatically.
+#   # Periods: 7 for week since we have daily data
+#   #          365 for year since we have daily data
+#   in.sample.msts <- msts(in.sample.df,seasonal.periods=c(7,365))
+#   TBATS_forecast[i] <- forecast(in.sample.msts, h=1, model=tbats.fit)[[2]][[1]]
+#   day_fcast[i] <- as.Date(time(out.sample[i,]))
+# }
+# 
+# TBATS_forecast_df <- data.frame(TBATS_forecast)
+# day_fcast_df <- data.frame(day_fcast)
+# 
+# ts_fcast_tbats <- timeSeries(TBATS_forecast_df, as.character(day_fcast), format="%Y-%m-%d")
+# 
+# end_time <- Sys.time()
+# print(end_time - start_time)
+
+# write.table(ts_fcast_tbats, file = "../data/tbats.csv", row.names=TRUE,
+#             col.names=c('mw'), sep=",")
+
+ts_fcast_tbats <- read.tbats_data()
+
+# Computing errors on tbats
+tbats_bias <- mean(ts_fcast_tbats-out.sample)
+tbats_pbias <- mean((ts_fcast_tbats-out.sample)/out.sample)*100
+tbats_mape <- mean(abs((ts_fcast_tbats-out.sample)/out.sample))*100
+
+tbats_bias/1000 # en GW
+tbats_pbias
+tbats_mape
+
+# EXEMPLE WIN 2014
+ts.to.plot <- window(ts_daily, as.Date("2014-01-01"), as.Date("2014-03-01"))
+fcast.to.plot <- window(ts_fcast_tbats, as.Date("2014-01-01"), as.Date("2014-03-01"))
+
+plot(ts.to.plot, xlab='Date', ylab='Demande(MWh)', main='TBATS pr�vision vs observation (Hiver 2014)')
+lines(fcast.to.plot, col='blue')
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","black"))
+
+# EXEMPLE ETE 2014
+ts.to.plot <- window(ts_daily, as.Date("2014-06-01"), as.Date("2014-09-01"))
+fcast.to.plot <- window(ts_fcast_tbats, as.Date("2014-06-01"), as.Date("2014-09-01"))
+
+plot(ts.to.plot, xlab='Date', ylab='Demande(MWh)', main='TBATS pr�vision vs observation (�t� 2014)')
+lines(fcast.to.plot, col='blue')
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","black"))
+
+# EXEMPLE WIN 2015
+ts.to.plot <- window(ts_daily, as.Date("2015-01-01"), as.Date("2015-03-01"))
+fcast.to.plot <- window(ts_fcast_tbats, as.Date("2015-01-01"), as.Date("2015-03-01"))
+
+plot(ts.to.plot, xlab='Date', ylab='Demande(MWh)', main='TBATS pr�vision vs observation (Hiver 2015)')
+lines(fcast.to.plot, col='blue')
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","black"))
+
+# EXEMPLE ETE 2015
+ts.to.plot <- window(ts_daily, as.Date("2015-06-01"), as.Date("2015-09-01"))
+fcast.to.plot <- window(ts_fcast_tbats, as.Date("2015-06-01"), as.Date("2015-09-01"))
+
+plot(ts.to.plot, xlab='Date', ylab='Demande(MWh)', main='TBATS pr�vision vs observation (�t� 2015)')
+lines(fcast.to.plot, col='blue')
+legend("topleft",legend=c("pr�vision","observation"),lty=c(1,1),
+       col=c("blue","black"))
+
+
+
+######################################
+#       CREATING DUMMY VARIABLES     #
+######################################
+# 
+
+# # load features
+# combined_df = read.csv("../data/all_var_df.csv")
+# 
+# # creating dummy variables for months
+# month_vec <- format(as.Date(combined_df$Row.names), "%B")
+# is_ = factor(month_vec)
+# dummies_month = model.matrix(~is_ + 0)
+# combined_df = cbind(combined_df, dummies_month)
+# 
+# # removing one month (i.e. December) to avoid colinear variables
+# combined_df <- combined_df[c(1:5110), -c(8)]
+# 
+# # creating dummy variables for days of week
+# weekday_vec <- weekdays(as.Date(combined_df$Row.names))
+# is_ = factor(weekday_vec)
+# dummies_weekday = model.matrix(~is_ + 0)
+# combined_df = cbind(combined_df, dummies_weekday)
+# 
+# # removing one weekday (i.e. Sunday) to avoid colinear variables
+# combined_df <- combined_df[c(1:5110), -c(20)]
+# 
+# # creating dummy variables for christmas, christmas  + 1,  + 2, -1, -1
+# 
+# xmas  <- dates(as.character(holiday(2005:2018,"USChristmasDay")),format="Y-m-d")
+# is_xmas_day <-is.holiday(as.Date(combined_df$Row.names), xmas)*1
+# is_xmas_min_one <- is.holiday(as.Date(combined_df$Row.names) + 1, xmas)*1
+# is_xmas_plus_one <- is.holiday(as.Date(combined_df$Row.names)-1, xmas)*1
+# is_xmas_min_two <- is.holiday(as.Date(combined_df$Row.names) + 2, xmas)*1
+# is_xmas_plus_two <- is.holiday(as.Date(combined_df$Row.names)-2, xmas)*1
+# combined_df <- cbind(combined_df, is_xmas_day, is_xmas_min_one, is_xmas_min_two, is_xmas_plus_one, is_xmas_plus_two)
+# 
+# # creating dummy variable for good friday
+# goodfriday  <- dates(as.character(holiday(2005:2018,"USGoodFriday")),format="Y-m-d")
+# is_good_friday <-is.holiday(as.Date(combined_df$Row.names), goodfriday)*1
+# combined_df <- cbind(combined_df, is_good_friday)
+# 
+# # creating dummy variables for independance day
+# independance  <- dates(as.character(holiday(2005:2018,"USIndependenceDay")),format="Y-m-d")
+# is_independance_day <-is.holiday(as.Date(combined_df$Row.names), independance)*1
+# is_independance_min_one <- is.holiday(as.Date(combined_df$Row.names) + 1, independance)*1
+# is_independance_plus_one <- is.holiday(as.Date(combined_df$Row.names)-1, independance)*1
+# is_independance_min_two <- is.holiday(as.Date(combined_df$Row.names) + 2, independance)*1
+# is_independance_plus_two <- is.holiday(as.Date(combined_df$Row.names)-2, independance)*1
+# combined_df <- cbind(combined_df, is_independance_day, is_independance_min_one, is_independance_min_two,
+#                      is_independance_plus_one, is_independance_plus_two)
+# 
+# # creating dummy variable for labor day
+# laborday  <- dates(as.character(holiday(2005:2018,"USLaborDay")),format="Y-m-d")
+# is_laborday <-is.holiday(as.Date(combined_df$Row.names), laborday)*1
+# combined_df <- cbind(combined_df, is_laborday)
+# 
+# # creating dummy variable for newyearsday
+# newyearsday  <- dates(as.character(holiday(2005:2018,"USNewYearsDay")),format="Y-m-d")
+# is_newyears_day <-is.holiday(as.Date(combined_df$Row.names), newyearsday)*1
+# is_newyears_min_one <- is.holiday(as.Date(combined_df$Row.names) + 1, newyearsday)*1
+# is_newyears_plus_one <- is.holiday(as.Date(combined_df$Row.names)-1, newyearsday)*1
+# is_newyears_min_two <- is.holiday(as.Date(combined_df$Row.names) + 2, newyearsday)*1
+# is_newyears_plus_two <- is.holiday(as.Date(combined_df$Row.names)-2, newyearsday)*1
+# combined_df <- cbind(combined_df, is_newyears_day, is_newyears_min_one, is_newyears_min_two,
+#                      is_newyears_plus_one, is_newyears_plus_two)
+# 
+# # creating dummy variable for thanksgiving
+# thanksgiving  <- dates(as.character(holiday(2005:2018,"USThanksgivingDay")),format="Y-m-d")
+# is_thanksgiving_day <-is.holiday(as.Date(combined_df$Row.names), thanksgiving)*1
+# is_thanksgiving_plus_one <- is.holiday(as.Date(combined_df$Row.names)-1, thanksgiving)*1
+# combined_df <- cbind(combined_df, is_thanksgiving_day, is_thanksgiving_plus_one)
+# 
+# # creating dummy variable for US elections
+# elections  <- dates(as.character(holiday(2005:2018,"USElectionDay")),format="Y-m-d")
+# is_election_day <-is.holiday(as.Date(combined_df$Row.names), elections)*1
+# combined_df <- cbind(combined_df, is_election_day)
+# 
+# # creating lag variables for HDD-1, HDD-2, CDD-1 and CDD-2
+# combined_df$CDD_min_one <- 0
+# combined_df$CDD_min_two <- 0
+# combined_df$HDD_min_one <- 0
+# combined_df$HDD_min_two <- 0
+# 
+# combined_df$CDD_min_one[[2]] <- combined_df$CDD_C[[1]]
+# combined_df$HDD_min_one[[2]] <- combined_df$HDD_C[[1]]
+# 
+# for (i in 3:5110) {
+#   combined_df$CDD_min_one[[i]] <- combined_df$CDD_C[[i-1]]
+#   combined_df$HDD_min_one[[i]] <- combined_df$HDD_C[[i-1]]
+#   combined_df$CDD_min_two[[i]] <- combined_df$CDD_C[[i-2]]
+#   combined_df$HDD_min_two[[i]] <- combined_df$HDD_C[[i-2]]
+# }
+# 
+# # saving dataframe for later use
+# write.csv(combined_df, file = "../data/csv_for_regression.csv", row.names=FALSE)
+
+##############################################
+#     MULTIPLE LINEAR REGRESSION (STEP1)     #
+##############################################
+# 
+
+# loading data from previous step
+combined_df = read.csv("../data/csv_for_regression.csv")
+
+# division of combined_df into a training and validation set
+training_df <- combined_df[1:3285,]
+validation_df <- combined_df[3286:4380,]
+
+reg_one.fit = lm(mw ~ HDD_C + CDD_C +
+                   is_April + is_August + is_February + is_January + is_July + is_June + 
+                   is_March + is_May + is_November + is_October + is_September + 
+                   is_Friday + is_Monday + is_Saturday + is_Thursday + is_Tuesday + is_Wednesday + 
+                   is_xmas_day + is_xmas_min_one + is_xmas_min_two + is_xmas_plus_one + is_xmas_plus_two + 
+                   is_good_friday + 
+                   is_independance_day + is_independance_min_one + is_independance_min_two + 
+                   is_independance_plus_one + is_independance_plus_two + 
+                   is_laborday + 
+                   is_newyears_day + is_newyears_min_one + is_newyears_min_two + 
+                   is_newyears_plus_one + is_newyears_plus_two + 
+                   is_thanksgiving_day + is_thanksgiving_plus_one + 
+                   is_election_day + 
+                   CDD_min_one + CDD_min_two + HDD_min_one + HDD_min_two,
+                 data=training_df, x=T, y=T)
+
+# printing a description of the model
+sink("reg_one_all_variables.fit.out")
+summary(reg_one.fit)
+sink()
+
+# using trained model to predict demand(mw) on validation set
+p <- predict(reg_one.fit, validation_df)
+
+# Computing MAPE, bias and %biais on reg_one.fit on validation
+reg_one_bias <- mean(p-validation_df$mw)
+reg_one_pbias <- mean((p-validation_df$mw)/validation_df$mw)*100
+reg_one_mape <- mean(abs((p-validation_df$mw)/validation_df$mw))*100
+
+reg_one_bias/1000 # en GW
+reg_one_pbias
+reg_one_mape
+
+# Plotting acf/pacf of residuals
+acf2(residuals(reg_one.fit))
+
+# Plotting residuals vs 
+par(mfrow=c(1,1))
+plot(training_df$CDD_C,residuals(reg_one.fit),xlab="CDD_C", main='Graphique des r�sidus', ylab='R�sidus (mW)')
+plot(training_df$HDD_C,residuals(reg_one.fit),xlab="HDD_C", main='Graphique des r�sidus', ylab='R�sidus (mW)')
+plot(training_df$CDD_min_one,residuals(reg_one.fit),xlab="CDD-1", main='Graphique des r�sidus', ylab='R�sidus (mW)')
+plot(training_df$HDD_min_one,residuals(reg_one.fit),xlab="HDD-1", main='Graphique des r�sidus', ylab='R�sidus (mW)')
+plot(training_df$CDD_min_two,residuals(reg_one.fit),xlab="CDD-2", main='Graphique des r�sidus', ylab='R�sidus (mW)')
+plot(training_df$HDD_min_two,residuals(reg_one.fit),xlab="HDD-2", main='Graphique des r�sidus', ylab='R�sidus (mW)')
+plot(reg_one.fit$fitted.values,residuals(reg_one.fit),xlab="Pr�visions (MWh)", ylab="R�sidus (MWh)")
+
+boxplot(residuals(reg_one.fit)~factor(training_df$is_January), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='Janvier')
+boxplot(residuals(reg_one.fit)~factor(training_df$is_February), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='F�vrier')
+boxplot(residuals(reg_one.fit)~factor(training_df$is_March), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='Mars')
+boxplot(residuals(reg_one.fit)~factor(training_df$is_April), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='Avril')
+
+boxplot(residuals(reg_one.fit)~factor(training_df$is_Friday), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='Vendredi')
+boxplot(residuals(reg_one.fit)~factor(training_df$is_Saturday), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='Samedi')
+boxplot(residuals(reg_one.fit)~factor(training_df$is_Monday), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='Lundi')
+
+
+boxplot(residuals(reg_one.fit)~factor(training_df$is_independance_day), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='Independance Day')
+boxplot(residuals(reg_one.fit)~factor(training_df$is_laborday), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='Labor Day')
+boxplot(residuals(reg_one.fit)~factor(training_df$is_xmas_day), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='No�l')
+
+# plotting QQ plots
+qqnorm(residuals(reg_one.fit), xlab='Quantiles th�oriques', ylab='Quantiles �chantillon�s', main='Diagrame Q-Q')
+qqline(residuals(reg_one.fit))
+
+# Durbin-Watson test for autocorrelated residuals
+
+print(dwtest(reg_one.fit))
+
+
+##############################################
+#     MULTIPLE LINEAR REGRESSION (STEP2)     #
+##############################################
+# 
+# From the ACF/PACF we saw that the residuals were auto-correlated. We will differenciate with a step of 7
+# and see if this solves a portion of the problem.
+
+# loading data from previous step
+combined_df = read.csv("../data/csv_for_regression.csv")
+
+# differencing with lag 1 and lag 7
+ts_diff1 <- diff(ts_daily, lag = 1, differences = 1)
+plot(ts_daily, ylab='MWh',xlab='Date (s�rie originale)')
+plot(ts_diff1, ylab='MWh',xlab='Date (s�rie avec diff�renciation de 1 jour')
+ts_diff7 <- diff(ts_daily, lag = 7, differences = 1)
+plot(ts_diff7, ylab='MWh',xlab='Date (s�rie avec diff�renciation de 7 jours)')
+ts_diff365 <- diff(ts_daily, lag=365, differences = 1)
+plot(ts_diff365, ylab='MWh', xlab='Date (s�rie avec diff�renciation de 365 jours)')
+ts_diff7_365 <- diff(ts_diff7, lag=365, differences=1)
+plot(ts_diff7_365, ylab='MWh', xlab='Date (s�rie avec diff�renciation de 365 jours)')
+
+
+# adding differenced to combined_df
+combined_df <- cbind(combined_df, ts_diff1, ts_diff7)
+
+# division of combined_df into a training and validation set
+training_df <- combined_df[9:3285,]
+validation_df <- combined_df[3286:4380,]
+
+# training on differenced demand (7 days)
+df_test <- data.frame(ts_diff7)
+avector <- as.vector(df_test$mw)
+res_undiff <- diffinv(avector, lag=7, differences=1, xi=c(101634.4, 106812.5, 119502.8, 122397.9, 126375.3, 132037.5, 127719.9))
+
+
+reg_two.fit = lm(mw.2 ~ HDD_C + CDD_C +
+                   is_April + is_August + is_February + is_January + is_July + is_June + 
+                   is_March + is_May + is_November + is_October + is_September + 
+                   is_Friday + is_Monday + is_Saturday + is_Thursday + is_Tuesday + is_Wednesday + 
+                   is_xmas_day + is_xmas_min_one + is_xmas_min_two + is_xmas_plus_one + is_xmas_plus_two + 
+                   is_good_friday + 
+                   is_independance_day + is_independance_min_one + is_independance_min_two + 
+                   is_independance_plus_one + is_independance_plus_two + 
+                   is_laborday + 
+                   is_newyears_day + is_newyears_min_one + is_newyears_min_two + 
+                   is_newyears_plus_one + is_newyears_plus_two + 
+                   is_thanksgiving_day + is_thanksgiving_plus_one + 
+                   is_election_day + 
+                   CDD_min_one + CDD_min_two + HDD_min_one + HDD_min_two,
+                 data=training_df, x=T, y=T)
+
+# printing a description of the model
+sink("reg_two_all_variables.fit.out")
+summary(reg_two.fit)
+sink()
+
+# using trained model to predict demand(mw) on validation set
+p2 <- predict.lm(reg_two.fit, validation_df)
+
+p2_vec <- as.vector(p2)
+p2_undiff <- diffinv(p2_vec, lag=7, differences=1, xi=c(115073.9, 131772.2, 135137.6, 129312.2, 122323.3, 123961.0, 145119.4))
+head(p2_undiff)
+head(validation_df$mw)
+p2_undiff <- p2_undiff[-c(1096:1102)]
+
+
+
+# Computing MAPE, bias and %biais on reg_two.fit on validation
+reg_two_bias <- mean(p2_undiff-validation_df$mw)
+reg_two_pbias <- mean((p2_undiff-validation_df$mw)/validation_df$mw)*100
+reg_two_mape <- mean(abs((p2_undiff-validation_df$mw)/validation_df$mw))*100
+
+reg_two_bias/1000 # en GW
+reg_two_pbias
+reg_two_mape
+
+# Plotting acf/pacf of residuals
+acf2(residuals(reg_two.fit))
+
+# errors are very poor (80% mape) but the ACF/PACF are looking better. 
+
+##############################################
+#     MULTIPLE LINEAR REGRESSION (STEP3)     #
+##############################################
+# 
+# Letting the differenciation down for now. We are going back to STEP1, this time we will remove some of the 
+# variables and see if we can improve the errors, ACF/PACF, etc. 
+
+
+# loading data from previous step
+combined_df = read.csv("../data/csv_for_regression.csv")
+
+# division of combined_df into a training and validation set
+training_df <- combined_df[1:3285,]
+validation_df <- combined_df[3286:4380,]
+
+reg_three.fit = lm(mw ~ HDD_C + CDD_C +
+                   is_Friday + is_Monday + is_Saturday + is_Thursday + is_Tuesday + is_Wednesday,
+                 data=training_df, x=T, y=T)
+
+# printing a description of the model
+sink("reg_three_all_variables.fit.out")
+summary(reg_three.fit)
+sink()
+
+# using trained model to predict demand(mw) on validation set
+p3 <- predict(reg_three.fit, validation_df)
+
+# Computing MAPE, bias and %biais on reg_three.fit on validation
+reg_three_bias <- mean(p3-validation_df$mw)
+reg_three_pbias <- mean((p3-validation_df$mw)/validation_df$mw)*100
+reg_three_mape <- mean(abs((p3-validation_df$mw)/validation_df$mw))*100
+
+reg_three_bias/1000 # en GW
+reg_three_pbias
+reg_three_mape
+
+# Plotting acf/pacf of residuals
+acf2(residuals(reg_three.fit))
+
+# Plotting residuals vs 
+par(mfrow=c(1,1))
+plot(training_df$CDD_C,residuals(reg_three.fit),xlab="CDD_C", main='Graphique des r�sidus', ylab='R�sidus (mW)')
+plot(training_df$HDD_C,residuals(reg_three.fit),xlab="HDD_C", main='Graphique des r�sidus', ylab='R�sidus (mW)')
+plot(training_df$CDD_min_one,residuals(reg_three.fit),xlab="CDD-1", main='Graphique des r�sidus', ylab='R�sidus (mW)')
+plot(training_df$HDD_min_one,residuals(reg_three.fit),xlab="HDD-1", main='Graphique des r�sidus', ylab='R�sidus (mW)')
+plot(training_df$CDD_min_two,residuals(reg_three.fit),xlab="CDD-2", main='Graphique des r�sidus', ylab='R�sidus (mW)')
+plot(training_df$HDD_min_two,residuals(reg_three.fit),xlab="HDD-2", main='Graphique des r�sidus', ylab='R�sidus (mW)')
+plot(reg_three.fit$fitted.values,residuals(reg_three.fit),xlab="Pr�visions (MWh)", ylab="R�sidus (MWh)")
+
+boxplot(residuals(reg_three.fit)~factor(training_df$is_January), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='Janvier')
+boxplot(residuals(reg_three.fit)~factor(training_df$is_February), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='F�vrier')
+boxplot(residuals(reg_three.fit)~factor(training_df$is_March), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='Mars')
+boxplot(residuals(reg_three.fit)~factor(training_df$is_April), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='Avril')
+
+boxplot(residuals(reg_three.fit)~factor(training_df$is_Friday), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='Vendredi')
+boxplot(residuals(reg_three.fit)~factor(training_df$is_Saturday), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='Samedi')
+boxplot(residuals(reg_three.fit)~factor(training_df$is_Monday), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='Lundi')
+
+
+boxplot(residuals(reg_three.fit)~factor(training_df$is_independance_day), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='Independance Day')
+boxplot(residuals(reg_three.fit)~factor(training_df$is_xmas_day), main='Boxplot des r�sidus', ylab='R�sidus (MWh)',
+        xlab='No�l')
+
+
+# plotting QQ plots
+qqnorm(residuals(reg_three.fit), xlab='Quantiles th�oriques', ylab='Quantiles �chantillon�s', main='Diagrame Q-Q')
+qqline(residuals(reg_three.fit))
+
+# Durbin-Watson test for autocorrelated residuals
+
+print(dwtest(reg_three.fit))
+
+
+##################################################
+#    LIN. REGRESSION WITH AUTO-ARIMA (STEP4)     #
+##################################################
+# 
+# After trying different combinations of variables, the lin regression model doesnt seem to get better. We will
+# now use fit a regression model with AR errors. We will reuse the same variables as in STEP1, but this time, 
+# we will add a AR error component.
+
+
+# loading data from previous step
+combined_df = read.csv("../data/csv_for_regression.csv")
+
+# division of combined_df into a training and validation set
+training_df <- combined_df[1:3285,]
+validation_df <- combined_df[3286:4380,]
+
+reg4_w_arima.fit = auto.arima(training_df$mw, xreg=cbind(training_df$HDD_C, training_df$CDD_C, training_df$is_April ,
+                                                   training_df$is_August, training_df$is_February, 
+                                                   training_df$is_January, training_df$is_July, training_df$is_June ,
+                                                   training_df$is_March, training_df$is_May, training_df$is_November ,
+                                                   training_df$is_October, training_df$is_September ,
+                                                   training_df$is_Friday, training_df$is_Monday, 
+                                                   training_df$is_Saturday, training_df$is_Thursday, 
+                                                   training_df$is_Tuesday, training_df$is_Wednesday, 
+                                                   training_df$is_xmas_day, training_df$is_xmas_min_one ,
+                                                   training_df$is_xmas_min_two, training_df$is_xmas_plus_one, 
+                                                   training_df$is_xmas_plus_two, training_df$is_good_friday ,
+                                                   training_df$is_independance_day, training_df$is_independance_min_one ,
+                                                   training_df$is_independance_min_two, training_df$is_independance_plus_one, 
+                                                   training_df$is_independance_plus_two, training_df$is_laborday, 
+                                                   training_df$is_newyears_day, training_df$is_newyears_min_one, 
+                                                   training_df$is_newyears_min_two, training_df$is_newyears_plus_one ,
+                                                   training_df$is_newyears_plus_two, training_df$is_thanksgiving_day, 
+                                                   training_df$is_thanksgiving_plus_one, training_df$is_election_day, 
+                                                   training_df$CDD_min_one, training_df$CDD_min_two, training_df$HDD_min_one ,
+                                                   training_df$HDD_min_two))
+
+
+# printing a description of the model
+sink("reg4_w_arima_all_variables.fit.out")
+print(reg4_w_arima.fit)          # Selects ARIMA(1,1,2) with non-zero mean
+sink()
+
+acf(residuals(reg4_w_arima.fit)[-(1:2)],
+    main="Structure des r�sidus avec auto-arima")
+
+# using trained model to predict demand(mw) on validation set
+p4 <- predict(reg4_w_arima.fit,n.ahead=1,newxreg=cbind(validation_df$HDD_C, validation_df$CDD_C, validation_df$is_April,
+                                                  validation_df$is_August, validation_df$is_February, 
+                                                validation_df$is_January, validation_df$is_July, validation_df$is_June,
+                                                  validation_df$is_March, validation_df$is_May, validation_df$is_November,
+                                                  validation_df$is_October, validation_df$is_September,
+                                                  validation_df$is_Friday, validation_df$is_Monday, 
+                                                validation_df$is_Saturday, validation_df$is_Thursday, 
+                                                validation_df$is_Tuesday, validation_df$is_Wednesday, 
+                                                validation_df$is_xmas_day, validation_df$is_xmas_min_one,
+                                                  validation_df$is_xmas_min_two, validation_df$is_xmas_plus_one, 
+                                                validation_df$is_xmas_plus_two, validation_df$is_good_friday,
+                                                  validation_df$is_independance_day, validation_df$is_independance_min_one,
+                                                  validation_df$is_independance_min_two, validation_df$is_independance_plus_one, 
+                                                validation_df$is_independance_plus_two, validation_df$is_laborday, 
+                                                validation_df$is_newyears_day, validation_df$is_newyears_min_one, 
+                                                validation_df$is_newyears_min_two, validation_df$is_newyears_plus_one,
+                                                  validation_df$is_newyears_plus_two, validation_df$is_thanksgiving_day, 
+                                                validation_df$is_thanksgiving_plus_one, validation_df$is_election_day, 
+                                                validation_df$CDD_min_one, validation_df$CDD_min_two, validation_df$HDD_min_one +
+                                                  validation_df$HDD_min_two))
+
+
+# Computing MAPE, bias and %biais on reg4_w_arima.fit on validation
+reg4_w_arima_bias <- mean(p4[[1]][1:1095]-validation_df$mw)
+reg4_w_arima_pbias <- mean((p4[[1]][1:1095]-validation_df$mw)/validation_df$mw)*100
+reg4_w_arima_mape <- mean(abs((p4[[1]][1:1095]-validation_df$mw)/validation_df$mw))*100
+
+reg4_w_arima_bias/1000 # en GW
+reg4_w_arima_pbias
+reg4_w_arima_mape
+
+# Plotting acf/pacf of residuals
+acf2(residuals(reg4_w_arima.fit))
+
+# plotting QQ plots
+qqnorm(residuals(reg4_w_arima.fit), xlab='Quantiles th�oriques', ylab='Quantiles �chantillon�s', main='Diagrame Q-Q')
+qqline(residuals(reg4_w_arima.fit))
+
+# Durbin-Watson test for autocorrelated residuals
+
+# print(dwtest(reg4_w_arima.fit))
+
+
+
+##################################################
+#    LIN. REGRESSION WITH AUTO-ARIMA (STEP5)     #
+##################################################
+# 
+# After trying different combinations of variables, the lin regression model doesnt seem to get better. We will
+# now use fit a regression model with AR errors. We will reuse the same variables as in STEP3, but this time, 
+# we will add a AR error component.
+
+
+# loading data from previous step
+combined_df = read.csv("../data/csv_for_regression.csv")
+
+# division of combined_df into a training and validation set
+training_df <- combined_df[1:3285,]
+validation_df <- combined_df[3286:4380,]
+
+reg5_w_arima.fit = auto.arima(training_df$mw, xreg=cbind(training_df$HDD_C, training_df$CDD_C, 
+                                                           training_df$is_Friday, training_df$is_Monday, 
+                                                         training_df$is_Saturday, training_df$is_Thursday, 
+                                                         training_df$is_Tuesday, training_df$is_Wednesday))
+
+
+# printing a description of the model
+sink("reg5_w_arima_all_variables.fit.out")
+print(reg5_w_arima.fit)          # Selects ARIMA(2,1,2) with non-zero mean
+sink()
+
+acf(residuals(reg5_w_arima.fit)[-(1:2)],
+    main="Structure des r�sidus avec auto-arima")
+
+# using trained model to predict demand(mw) on validation set
+p5 <- predict(reg5_w_arima.fit,n.ahead=1,newxreg=cbind(validation_df$HDD_C, validation_df$CDD_C, 
+                                                  validation_df$is_Friday, validation_df$is_Monday, 
+                                                  validation_df$is_Saturday, validation_df$is_Thursday, 
+                                                  validation_df$is_Tuesday, validation_df$is_Wednesday))
+
+
+# Computing MAPE, bias and %biais on reg5_w_arima.fit on validation
+reg5_w_arima_bias <- mean(p5[[1]][1:1095]-validation_df$mw)
+reg5_w_arima_pbias <- mean((p5[[1]][1:1095]-validation_df$mw)/validation_df$mw)*100
+reg5_w_arima_mape <- mean(abs((p5[[1]][1:1095]-validation_df$mw)/validation_df$mw))*100
+
+reg5_w_arima_bias/1000 # en GW
+reg5_w_arima_pbias
+reg5_w_arima_mape
+
+# Plotting acf/pacf of residuals
+acf2(residuals(reg5_w_arima.fit))
+
+# plotting QQ plots
+qqnorm(residuals(reg5_w_arima.fit), xlab='Quantiles th�oriques', ylab='Quantiles �chantillon�s', main='Diagrame Q-Q')
+qqline(residuals(reg5_w_arima.fit))
+
+# Durbin-Watson test for autocorrelated residuals
+
+#print(dwtest(reg5_w_arima.fit))
